@@ -12,7 +12,6 @@ package File::KeePass;
 
 use strict;
 use warnings;
-use CGI::Ex::Dump qw(debug);
 use Carp qw(croak);
 use Crypt::Rijndael;
 use Digest::SHA qw(sha256);
