@@ -6,7 +6,7 @@ File::KeePass - Interface to KeePass V1 database files
 
 =cut
 
-File::KeePass->new->run,exit if $0 eq __FILE__;
+File::KeePass::run(),exit if $0 eq __FILE__;
 
 package File::KeePass;
 
@@ -31,7 +31,7 @@ sub new {
 }
 
 sub run {
-    my $self = shift;
+    my $self = ref($_[0]) ? shift() : __PACKAGE__->new;
     my $file = shift || shift(@ARGV) || croak "Usage: $0 file.kdb\n";
     my $pass = shift || shift(@ARGV) || do { require IO::Prompt; ''.IO::Prompt::prompt("Enter your master key: ", -e => '*') };
     my $groups = $self->load_db($file, $pass);
@@ -40,15 +40,15 @@ sub run {
 
 sub load_db {
     my $self = shift;
-    my $file = shift || croak "Missing file";
-    my $pass = shift || croak "Missing pass";
+    my $file = shift || croak "Missing file\n";
+    my $pass = shift || croak "Missing pass\n";
 
-    open(my $fh, '<', $file) || croak "Couldn't open $file: $!";
+    open(my $fh, '<', $file) || croak "Couldn't open $file: $!\n";
     my $total_size = -s $file;
     read($fh, my $buffer, $total_size);
     close $fh;
-    croak "Couldn't read entire file" if length($buffer) != $total_size;
-    croak "Unexpected file size ($total_size < ".DB_HEADER_SIZE().")" if $total_size < DB_HEADER_SIZE;
+    croak "Couldn't read entire file contents.\n" if length($buffer) != $total_size;
+    croak "File was smaller than db header ($total_size < ".DB_HEADER_SIZE().")\n" if $total_size < DB_HEADER_SIZE;
 
     return $self->parse_db($buffer, $pass);
 }
@@ -56,23 +56,23 @@ sub load_db {
 sub parse_db {
     my ($self, $buffer, $pass) = @_;
 
-    # read in the headers
-    my $sig1       = unpack 'L', substr($buffer,   0, 4);    # memcpyFromLEnd32(&sig1,buffer);
-    my $sig2       = unpack 'L', substr($buffer,   4, 4);    # memcpyFromLEnd32(&sig2,buffer+4);
-    my $flags      = unpack 'L', substr($buffer,   8, 4);    # memcpyFromLEnd32(&Flags,buffer+8);
-    my $ver        = unpack 'L', substr($buffer,  12, 4);    # memcpyFromLEnd32(&Version,buffer+12);
-    my $seed_rand  = substr($buffer,  16, 16);   # memcpy(FinalRandomSeed,buffer+16,16);
-    my $enc_iv     = substr($buffer,  32, 16);   # memcpy(EncryptionIV,buffer+32,16);
-    my $n_groups   = unpack 'L', substr($buffer,  48, 4);    # memcpyFromLEnd32(&NumGroups,buffer+48);
-    my $n_entries  = unpack 'L', substr($buffer,  52, 4);    # memcpyFromLEnd32(&NumEntries,buffer+52);
-    my $checksum   = substr($buffer,  56, 32);   # memcpy(ContentsHash,buffer+56,32);
-    my $seed_key   = substr($buffer,  88, 32);   # memcpy(TransfRandomSeed,buffer+88,32);
-    my $seed_rot_n = unpack 'L', substr($buffer, 120, 4);    # memcpyFromLEnd32(&KeyTransfRounds,buffer+120);
+    # read the headers
+    my $sig1       = unpack 'L', substr($buffer,   0, 4);
+    my $sig2       = unpack 'L', substr($buffer,   4, 4);
+    my $flags      = unpack 'L', substr($buffer,   8, 4);
+    my $ver        = unpack 'L', substr($buffer,  12, 4);
+    my $seed_rand  = substr($buffer, 16, 16);
+    my $enc_iv     = substr($buffer, 32, 16);
+    my $n_groups   = unpack 'L', substr($buffer,  48, 4);
+    my $n_entries  = unpack 'L', substr($buffer,  52, 4);
+    my $checksum   = substr($buffer, 56, 32);
+    my $seed_key   = substr($buffer, 88, 32);
+    my $seed_rot_n = unpack 'L', substr($buffer, 120, 4);
     die "Wrong sig1 ($sig1 != ".PWM_DBSIG_1().")\n" if $sig1 != PWM_DBSIG_1;
     die "Wrong sig2 ($sig2 != ".PWM_DBSIG_2().")\n" if $sig2 != PWM_DBSIG_2;
     die "Unsupported File version ($ver).\n" if $ver & 0xFFFFFF00 != PWM_DBVER_DW & 0xFFFFFF00;
-    my $enc_type = ($flags & PWM_FLAG_RIJNDAEL) ? 'Rijndael_Cipher'
-                 : ($flags & PWM_FLAG_TWOFISH)  ? 'Twofish_Cipher'
+    my $enc_type = ($flags & PWM_FLAG_RIJNDAEL) ? 'rijndael'
+                 : ($flags & PWM_FLAG_TWOFISH)  ? 'twofish'
                  : die "Unknown Encryption Algorithm.";
 
     # use the headers to generate our encryption key in conjunction with the password
@@ -84,7 +84,7 @@ sub parse_db {
 
     # decrypt the buffer
     my $crypto_size;
-    if ($enc_type eq 'Rijndael_Cipher') {
+    if ($enc_type eq 'rijndael') {
         my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
         $cipher->set_iv($enc_iv);
         my $orig_size = length($buffer);
@@ -110,19 +110,19 @@ sub parse_groups {
     my ($self, $buffer, $n_groups) = @_;
     my $pos = 0;
 
-    my %gmap; # allow entries to find their groups (group map)
     my @groups;
-    my @gref = (\@groups);
+    my %gmap; # allow entries to find their groups (group map)
+    my @gref = (\@groups); # group ref pointer stack - let levels nest safely
     my $previous_level = 0;
     my $group = {};
     while ($n_groups) {
         my $type = unpack 'S', substr($buffer, $pos, 2);
         $pos += 2;
-        die "Unexpected error: Offset is out of range. ($pos)" if $pos >= length($buffer);
+        die "Group header offset is out of range. ($pos)" if $pos >= length($buffer);
 
         my $size = unpack 'L', substr($buffer, $pos, 4);
         $pos += 4;
-        die "Unexpected error: Offset is out of range. ($pos, $size)" if $pos + $size > length($buffer);
+        die "Group header offset is out of range. ($pos, $size)" if $pos + $size > length($buffer);
 
         if ($type == 1) {
             $group->{'id'} = unpack 'L', substr($buffer, $pos, 4);
@@ -139,6 +139,7 @@ sub parse_groups {
             my $level = $group->{'level'} || 0;
             if ($previous_level > $level) {
                 splice @gref, $previous_level, $previous_level - $level, ();
+                push @gref, \@groups if !@gref;
             } elsif ($previous_level < $level) {
                 push @gref, ($gref[-1]->[-1]->{'groups'} = []);
             }
@@ -159,11 +160,11 @@ sub parse_entries {
     while ($n_entries) {
         my $type = unpack 'S', substr($buffer, $pos, 2);
         $pos += 2;
-        die "Unexpected error: Offset is out of range. ($pos)" if $pos >= length($buffer);
+        die "Entry header offset is out of range. ($pos)" if $pos >= length($buffer);
 
         my $size = unpack 'L', substr($buffer, $pos, 4);
         $pos += 4;
-        die "Unexpected error: Offset is out of range. ($pos, ".length($buffer).", $size)" if $pos + $size > length($buffer);
+        die "Entry header offset is out of range. ($pos, ".length($buffer).", $size)" if $pos + $size > length($buffer);
 
         if ($type == 1) {
             $entry->{'uuid'} = 1 #KpxUuid(pData);
