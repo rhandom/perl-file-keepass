@@ -25,6 +25,8 @@ use constant PWM_FLAG_RIJNDAEL => 2;
 use constant PWM_FLAG_ARCFOUR  => 4;
 use constant PWM_FLAG_TWOFISH  => 8;
 
+our $VERSION = '0.01';
+
 sub new {
     my $class = shift;
     return bless {}, $class;
