@@ -105,6 +105,11 @@ sub parse_db {
     # read the db
     my ($groups, $gmap, $pos) = $self->parse_groups($buffer, $n_groups);
     $self->parse_entries($buffer, $n_entries, $pos, $gmap, $groups);
+
+    if (!defined(wantarray)) {
+        $self->{'groups'} = $groups;
+        return 1;
+    }
     return $groups;
 }
 
@@ -132,7 +137,7 @@ sub parse_groups {
             $group->{'title'} = substr($buffer, $pos, $size);
             $group->{'title'} =~ s/\0$//;
         } elsif ($type == 7) {
-            $group->{'image'} = unpack 'L', substr($buffer, $pos, 4);
+            $group->{'icon'} = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 8) {
             $group->{'level'} = unpack 'S', substr($buffer, $pos, 2);
         } elsif ($type == 0xFFFF) {
@@ -173,7 +178,7 @@ sub parse_entries {
         } elsif ($type == 2) {
             $entry->{'group_id'} = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 3) {
-            $entry->{'image'} = unpack 'L', substr($buffer, $pos, 4);
+            $entry->{'icon'} = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 4) {
             $entry->{'title'} = substr($buffer, $pos, $size);
             $entry->{'title'} =~ s/\0$//;
@@ -202,7 +207,7 @@ sub parse_entries {
             my $gid = delete $entry->{'group_id'};
             my $ref = $gmap->{$gid};
             if (!$ref) { # orphaned nodes go in special group
-                $ref = $gmap->{0} = {id => 0, title => '*Orphaned*', image => 0};
+                $ref = $gmap->{0} = {id => 0, title => '*Orphaned*', icon => 0};
                 push @$groups, $ref;
             }
 
@@ -231,6 +236,62 @@ sub parse_entries {
     }
 }
 
+###----------------------------------------------------------------###
+
+sub gen_db {
+    my $self = shift;
+    my $pass = shift;
+    croak "Missing pass\n" if ! defined($pass);
+    my $groups = shift || $self->groups;
+
+    my $seed_rand; $seed_rand .= chr(int(255 * rand())) for 1..16;
+    my $seed_key;  $seed_key  .= chr(int(255 * rand())) for 1..16;
+    my $enc_iv;    $enc_iv    .= chr(int(255 * rand())) for 1..16;
+    my $seed_rot_n = 50_000;
+
+    # use the headers to generate our encryption key in conjunction with the password
+    my $key = sha256($pass);
+    my $cipher = Crypt::Rijndael->new($seed_key, Crypt::Rijndael::MODE_ECB());
+    $key = $cipher->encrypt($key) for 1 .. $seed_rot_n;
+    $key = sha256($key);
+    $key = sha256($seed_rand, $key);
+
+    my $buffer = '';
+    my $n_groups = 0;
+    my $n_entries = 0;
+    # TODO - flatten out the data into $buffer
+
+    my $checksum = sha256($buffer);
+    $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
+    $cipher->set_iv($enc_iv);
+    my $crypto_size = length($buffer);
+    my $extra = 16 - ((1+length($buffer)) % 16);
+    $buffer .= "\0"x$extra;
+    $buffer .= chr($extra);
+
+    my $enc = $cipher->encrypt($buffer);
+
+    #use CGI::Ex::Dump qw(debug);
+    #debug  length($buffer),$extra;
+    #debug length($enc);
+
+    return ''
+        .pack('L', PWM_DBSIG_1())
+        .pack('L', PWM_DBSIG_2())
+        .pack('L', PWM_FLAG_RIJNDAEL())
+        .pack('L', PWM_DBVER_DW())
+        .$seed_rand
+        .$enc_iv
+        .pack('L', $n_groups)
+        .pack('L', $n_entries)
+        .$checksum
+        .$seed_key
+        .pack('L', $seed_rot_n)
+        .$enc;
+}
+
+###----------------------------------------------------------------###
+
 sub dump_groups {
     my ($self, $g, $indent) = @_;
     $indent = '' if ! $indent;
@@ -241,4 +302,59 @@ sub dump_groups {
     }
 }
 
+sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
+
+sub add_group {
+    my $self = shift;
+    my $args = shift;
+    my $groups;
+    my $level;
+    if (defined(my $pid = $args->{'parent_id'})) {
+        if (my $group = $self->find_group({id => $pid})) {
+            $groups = $group->{'groups'} ||= [];
+            $level  = $group->{'level'} || 0;
+            $level++;
+        }
+    }
+    $groups ||= $self->{'groups'} ||= [];
+    $level  ||= 0;
+
+    my $gid;
+    $gid = int((2**32-1) * rand()) while !$gid || $self->find_group({id => $gid});
+
+    push @$groups, {
+        title => defined($args->{'title'}) ? $args->{'title'} : '',
+        icon  => $args->{'icon'} || 0,
+        id    => $gid,
+    };
+
+    return $gid;
+}
+
+sub find_group {
+    my $self = shift;
+    my $args = shift;
+    die "Must specify one of id, title or icon" if !grep {defined $args->{$_}} qw(id title icon);
+    my $groups = shift || $self->groups;
+    for my $g (@$groups) {
+        if (   (!defined $args->{'id'}    || $g->{'id'}    eq $args->{'id'})
+            && (!defined $args->{'title'} || $g->{'title'} eq $args->{'title'})
+            && (!defined $args->{'icon'}  || $g->{'icon'}  eq $args->{'icon'})) {
+            return $g;
+        }
+        next if ! $g->{'groups'};
+        my $found = $self->find_group($args, $g->{'groups'});
+        return $found if $found;
+    }
+    return;
+}
+
+###----------------------------------------------------------------###
+
 1;
+
+__END__
+
+=head1 SYNOPSIS
+
+=cut
