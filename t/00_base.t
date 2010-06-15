@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More plan => 10;
+use Test::More tests => 10;
 
-use_ok(File::KeePass);
+use_ok('File::KeePass');
 
