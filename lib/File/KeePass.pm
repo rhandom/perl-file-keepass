@@ -15,6 +15,7 @@ use warnings;
 use Carp qw(croak);
 use Crypt::Rijndael;
 use Digest::SHA qw(sha256);
+use CGI::Ex::Dump qw(debug);
 
 use constant DB_HEADER_SIZE    => 124;
 use constant PWM_DBSIG_1       => 0x9AA2D903;
@@ -36,8 +37,9 @@ sub run {
     my $self = ref($_[0]) ? shift() : __PACKAGE__->new;
     my $file = shift || shift(@ARGV) || croak "Usage: $0 file.kdb\n";
     my $pass = shift || shift(@ARGV) || do { require IO::Prompt; ''.IO::Prompt::prompt("Enter your master key: ", -e => '*') };
-    my $groups = $self->load_db($file, $pass);
-    $self->dump_groups($_) for @$groups;
+    $self->load_db($file, $pass);
+    my $gen = $self->gen_db($pass, $self->groups, $self->header);
+    $self->dump_groups($_) for @{ $self->groups };
 }
 
 sub load_db {
@@ -58,15 +60,14 @@ sub load_db {
 sub parse_db {
     my ($self, $buffer, $pass) = @_;
 
+    # parse and verify headers
     my $head = $self->parse_header($buffer);
-    my $gen = $self->gen_header($head);
-
     die "Wrong sig1 ($head->{'sig1'} != ".PWM_DBSIG_1().")\n" if $head->{'sig1'} != PWM_DBSIG_1;
     die "Wrong sig2 ($head->{'sig2'} != ".PWM_DBSIG_2().")\n" if $head->{'sig2'} != PWM_DBSIG_2;
     die "Unsupported File version ($head->{'ver'}).\n" if $head->{'ver'} & 0xFFFFFF00 != PWM_DBVER_DW & 0xFFFFFF00;
     my $enc_type = ($head->{'flags'} & PWM_FLAG_RIJNDAEL) ? 'rijndael'
                  : ($head->{'flags'} & PWM_FLAG_TWOFISH)  ? 'twofish'
-                 : die "Unknown Encryption Algorithm.";
+                 : die "Unknown encryption type\n";
 
     # use the headers to generate our encryption key in conjunction with the password
     my $key = sha256($pass);
@@ -84,13 +85,14 @@ sub parse_db {
         $buffer = $cipher->decrypt(substr($buffer,DB_HEADER_SIZE));
         my $extra = ord(substr $buffer, -1, 1);
         $crypto_size = $orig_size - DB_HEADER_SIZE - $extra;
+        debug $extra, $crypto_size;
         $buffer = substr($buffer, 0, $crypto_size);
     } else {
         die "Unimplemented enc_type $enc_type";
     }
     die "Decryption failed.\nThe key is wrong or the file is damaged."
         if $crypto_size > 2147483446 || (!$crypto_size && $head->{'n_groups'});
-    die "Hash test failed.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)"
+    die "Checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)"
         if $head->{'checksum'} ne sha256($buffer);
 
     # read the db
@@ -252,24 +254,27 @@ sub gen_db {
     my $pass = shift;
     croak "Missing pass\n" if ! defined($pass);
     my $groups = shift || $self->groups;
+    my $head   = shift || {};
 
-    my $seed_rand; $seed_rand .= chr(int(255 * rand())) for 1..16;
-    my $enc_iv;    $enc_iv    .= chr(int(255 * rand())) for 1..16;
-    my $seed_key   = sha256(rand());
-    my $seed_rot_n = 50_000;
+    foreach my $key (qw(seed_rand enc_iv)) {
+        next if defined $head->{$key};
+        $head->{$key} = '';
+        $head->{$key} .= chr(int(255 * rand())) for 1..16;
+    }
+    $head->{'seed_key'}   = sha256(rand()) if ! defined $head->{'seed_key'};
+    $head->{'seed_rot_n'} = 50_000         if ! defined $head->{'seed_rot_n'};
 
     # use the headers to generate our encryption key in conjunction with the password
     my $key = sha256($pass);
-    my $cipher = Crypt::Rijndael->new($seed_key, Crypt::Rijndael::MODE_ECB());
-    $key = $cipher->encrypt($key) for 1 .. $seed_rot_n;
+    my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
+    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
     $key = sha256($key);
-    $key = sha256($seed_rand, $key);
+    $key = sha256($head->{'seed_rand'}, $key);
 
     my $buffer = '';
-    my $n_groups = 0;
-    my $n_entries = 0;
     my @entries;
     foreach my $g ($self->flat_groups($groups)) {
+        $head->{'n_groups'}++;
         $buffer .= pack('S', 1) . pack('L', 4) . pack('L', $g->{'id'});
         $buffer .= pack('S', 2) . pack('L', length($g->{'title'})+1) . "$g->{'title'}\0";
         $buffer .= pack('S', 7) . pack('L', 4) . pack('L', $g->{'icon'}  || 0);
@@ -278,32 +283,31 @@ sub gen_db {
         push @entries, @{ $g->{'entries'} } if $g->{'entries'};
     }
     foreach my $e (@entries) {
+        $head->{'n_entries'}++;
     # TODO - flatten out the data into $buffer
     }
 
-    my $checksum = sha256($buffer);
+    #my $orig_size = length($buffer);
+    #$buffer = $cipher->decrypt(substr($buffer,DB_HEADER_SIZE));
+    #my $extra = ord(substr $buffer, -1, 1);
+    #$crypto_size = $orig_size - DB_HEADER_SIZE - $extra;
+    #$buffer = substr($buffer, 0, $crypto_size);
+
+    $head->{'checksum'} = sha256($buffer);
     $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
-    $cipher->set_iv($enc_iv);
+    $cipher->set_iv($head->{'enc_iv'});
     my $crypto_size = length($buffer);
     my $extra = 16 - ((1+length($buffer)) % 16);
-    $buffer .= "\0"x$extra;
+    debug $extra, $crypto_size;;
+    $buffer .= ("\0"x$extra);
     $buffer .= chr($extra);
 
-    my $header = $self->gen_header({
-        sig1       => PWM_DBSIG_1(),
-        sig2       => PWM_DBSIG_2(),
-        flags      => PWM_FLAG_RIJNDAEL(),
-        ver        => PWM_DBVER_DW(),
-        seed_rand  => $seed_rand,
-        enc_iv     => $enc_iv,
-        n_groups   => $n_groups,
-        n_entries  => $n_entries,
-        checksum   => $checksum,
-        seed_key   => $seed_key,
-        seed_rot_n => $seed_rot_n,
-    });
-
-    my $enc = $cipher->encrypt($buffer);
+    local $head->{'sig1'}  = PWM_DBSIG_1();
+    local $head->{'sig2'}  = PWM_DBSIG_2();
+    local $head->{'flags'} = PWM_FLAG_RIJNDAEL();
+    local $head->{'ver'}   = PWM_DBVER_DW();
+    my $header = $self->gen_header($head);
+    my $enc    = $cipher->encrypt($buffer);
 
     return $header.$enc;
 }
@@ -311,14 +315,10 @@ sub gen_db {
 sub gen_header {
     my ($self, $args) = @_;
     my $header = ''
-        .pack('L', $args->{'sig1'})
-        .pack('L', $args->{'sig2'})
-        .pack('L', $args->{'flags'})
-        .pack('L', $args->{'ver'})
+        .pack('L4', @{ $args }{qw(sig1 sig2 flags ver)})
         .$args->{'seed_rand'}
         .$args->{'enc_iv'}
-        .pack('L', $args->{'n_groups'})
-        .pack('L', $args->{'n_entries'})
+        .pack('L2', @{ $args }{qw(n_groups n_entries)})
         .$args->{'checksum'}
         .$args->{'seed_key'}
         .pack('L', $args->{'seed_rot_n'});
@@ -339,6 +339,8 @@ sub dump_groups {
 }
 
 sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
+
+sub header { shift->{'header'} || croak "No header loaded yet\n" }
 
 sub add_group {
     my $self = shift;
