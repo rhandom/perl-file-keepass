@@ -78,15 +78,16 @@ sub parse_db {
 
     # decrypt the buffer
     my $crypto_size;
+    my $orig_buffer;
     if ($enc_type eq 'rijndael') {
         my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
         $cipher->set_iv($head->{'enc_iv'});
         my $orig_size = length($buffer);
         $buffer = $cipher->decrypt(substr($buffer,DB_HEADER_SIZE));
+        $orig_buffer = $buffer;
         my $extra = ord(substr $buffer, -1, 1);
         $crypto_size = $orig_size - DB_HEADER_SIZE - $extra;
-        debug $extra, $crypto_size;
-        $buffer = substr($buffer, 0, $crypto_size);
+        substr($buffer, $crypto_size, $orig_size-$crypto_size, ''); #$buffer = substr($buffer, 0, $crypto_size);
     } else {
         die "Unimplemented enc_type $enc_type";
     }
@@ -287,20 +288,11 @@ sub gen_db {
     # TODO - flatten out the data into $buffer
     }
 
-    #my $orig_size = length($buffer);
-    #$buffer = $cipher->decrypt(substr($buffer,DB_HEADER_SIZE));
-    #my $extra = ord(substr $buffer, -1, 1);
-    #$crypto_size = $orig_size - DB_HEADER_SIZE - $extra;
-    #$buffer = substr($buffer, 0, $crypto_size);
-
     $head->{'checksum'} = sha256($buffer);
     $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
     $cipher->set_iv($head->{'enc_iv'});
-    my $crypto_size = length($buffer);
-    my $extra = 16 - ((1+length($buffer)) % 16);
-    debug $extra, $crypto_size;;
-    $buffer .= ("\0"x$extra);
-    $buffer .= chr($extra);
+    my $extra = (16 - length($buffer) % 16) || 16; # always pad so we can always trim
+    $buffer .= chr($extra) for 1 .. $extra;
 
     local $head->{'sig1'}  = PWM_DBSIG_1();
     local $head->{'sig2'}  = PWM_DBSIG_2();
