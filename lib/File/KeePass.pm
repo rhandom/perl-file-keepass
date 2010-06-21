@@ -38,9 +38,9 @@ sub run {
     my $file = shift || shift(@ARGV) || croak "Usage: $0 file.kdb\n";
     my $pass = shift || shift(@ARGV) || do { require IO::Prompt; ''.IO::Prompt::prompt("Enter your master key: ", -e => '*') };
     $self->load_db($file, $pass);
-    debug $self->groups;
-    exit;
-#    my $gen = $self->gen_db($pass, $self->groups, $self->header);
+#    debug $self->groups;
+#    exit;
+    my $gen = $self->gen_db($pass, $self->groups, $self->header);
     $self->dump_groups($_) for @{ $self->groups };
 }
 
@@ -102,12 +102,9 @@ sub parse_db {
     my ($groups, $gmap, $pos) = $self->parse_groups($buffer, $head->{'n_groups'});
     $self->parse_entries($buffer, $head->{'n_entries'}, $pos, $gmap, $groups);
 
-    if (!defined(wantarray)) {
-        $self->{'header'} = $head;
-        $self->{'groups'} = $groups;
-        return 1;
-    }
-    return $groups;
+    $self->{'header'} = $head;
+    $self->{'groups'} = $groups;
+    return 1;
 }
 
 sub parse_header {
@@ -190,7 +187,7 @@ sub parse_entries {
         die "Entry header offset is out of range. ($pos, ".length($buffer).", $size)" if $pos + $size > length($buffer);
 
         if ($type == 1) {
-            $entry->{'uuid'} = 1 #KpxUuid(pData);
+            $entry->{'uuid'}      = unpack 'H*', substr($buffer, $pos, $size);
         } elsif ($type == 2) {
             $entry->{'group_id'}  = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 3) {
@@ -226,8 +223,7 @@ sub parse_entries {
                 push @$groups, $ref;
             }
 
-            if (     $entry->{'comment'} && $entry->{'comment'} eq 'KPX_CUSTOM_ICONS_4') {
-            } elsif ($entry->{'comment'} && $entry->{'comment'} eq 'KPX_GROUP_TREE_STATE') {
+            if ($entry->{'comment'} && $entry->{'comment'} eq 'KPX_GROUP_TREE_STATE') {
                 if (!defined($entry->{'binary'}) || length($entry->{'binary'}) < 4) {
                     warn "Discarded metastream KPX_GROUP_TREE_STATE because of a parsing error."
                 } else {
@@ -241,10 +237,12 @@ sub parse_entries {
                             $gmap->{$group_id}->{'expanded'} = $is_expanded;
                         }
                     }
+                }
+                $entry = {};
+                next;
             }
-            } else {
-                push @{ $ref->{'entries'} }, $entry;
-            }
+
+            push @{ $ref->{'entries'} }, $entry;
             $entry = {};
         } else {
             $entry->{'unknown'}->{$type} = substr($buffer, $pos, $size);
@@ -305,16 +303,34 @@ sub gen_db {
     my @entries;
     foreach my $g ($self->flat_groups($groups)) {
         $head->{'n_groups'}++;
-        $buffer .= pack('S', 1) . pack('L', 4) . pack('L', $g->{'id'});
-        $buffer .= pack('S', 2) . pack('L', length($g->{'title'})+1) . "$g->{'title'}\0";
-        $buffer .= pack('S', 7) . pack('L', 4) . pack('L', $g->{'icon'}  || 0);
-        $buffer .= pack('S', 8) . pack('L', 2) . pack('S', $g->{'level'} || 0);
-        $buffer .= pack('S', 0xFFFF) . pack('L', 0);
+        my @d = ([1,      pack('LL', 4, $g->{'id'})],
+                 [2,      pack('L', length($g->{'title'})+1)."$g->{'title'}\0"],
+                 [7,      pack('LL', 4, $g->{'icon'}  || 0)],
+                 [8,      pack('LS', 2, $g->{'level'} || 0)],
+                 [0xFFFF, pack('L', 0)]);
+        push @d, [$_, $g->{'unknown'}->{$_}] for keys %{ $g->{'unknown'} || {} };
+        $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         push @entries, @{ $g->{'entries'} } if $g->{'entries'};
     }
     foreach my $e (@entries) {
         $head->{'n_entries'}++;
-    # TODO - flatten out the data into $buffer
+        my @d = ([1,      pack('LH*', length($e->{'uuid'})/2, $e->{'uuid'})],
+                 [2,      pack('LL', 4, $e->{'group_id'}  || 0)],
+                 [3,      pack('LL', 4, $e->{'icon'}  || 0)],
+                 [4,      pack('L', length($e->{'title'})+1)."$e->{'title'}\0"],
+                 [5,      pack('L', length($e->{'url'})+1).   "$e->{'url'}\0"],
+                 [6,      pack('L', length($e->{'username'})+1). "$e->{'username'}\0"],
+                 [7,      pack('L', length($e->{'password'})+1). "$e->{'password'}\0"],
+                 [8,      pack('L', length($e->{'comment'})+1).  "$e->{'comment'}\0"],
+                 [9,      pack('L', 5, $self->gen_date($e->{'created'}))],
+                 [0xA,    pack('L', 5, $self->gen_date($e->{'modified'}))],
+                 [0xB,    pack('L', 5, $self->gen_date($e->{'accessed'}))],
+                 [0xC,    pack('L', 5, $self->gen_date($e->{'expires'}))],
+                 [0xD,    pack('L', length($e->{'bin_desc'})+1)."$e->{'bin_desc'}\0"],
+                 [0xE,    pack('L', length($e->{'binary'})).$e->{'binary'}],
+                 [0xFFFF, pack('L', 0)]);
+        push @d, [$_, $e->{'unknown'}->{$_}] for keys %{ $e->{'unknown'} || {} };
+        $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
     }
 
     $head->{'checksum'} = sha256($buffer);
@@ -335,6 +351,8 @@ sub gen_db {
 
 sub gen_header {
     my ($self, $args) = @_;
+    local $args->{'n_groups'}  = $args->{'n_groups'}  || 0;
+    local $args->{'n_entries'} = $args->{'n_entries'} || 0;
     my $header = ''
         .pack('L4', @{ $args }{qw(sig1 sig2 flags ver)})
         .$args->{'seed_rand'}
