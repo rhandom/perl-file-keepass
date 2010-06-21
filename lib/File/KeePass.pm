@@ -38,7 +38,9 @@ sub run {
     my $file = shift || shift(@ARGV) || croak "Usage: $0 file.kdb\n";
     my $pass = shift || shift(@ARGV) || do { require IO::Prompt; ''.IO::Prompt::prompt("Enter your master key: ", -e => '*') };
     $self->load_db($file, $pass);
-    my $gen = $self->gen_db($pass, $self->groups, $self->header);
+    debug $self->groups;
+    exit;
+#    my $gen = $self->gen_db($pass, $self->groups, $self->header);
     $self->dump_groups($_) for @{ $self->groups };
 }
 
@@ -92,7 +94,7 @@ sub parse_db {
         die "Unimplemented enc_type $enc_type";
     }
     die "Decryption failed.\nThe key is wrong or the file is damaged."
-        if $crypto_size > 2147483446 || (!$crypto_size && $head->{'n_groups'});
+        if $crypto_size > 2**31 || (!$crypto_size && $head->{'n_groups'});
     die "Checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)"
         if $head->{'checksum'} ne sha256($buffer);
 
@@ -165,6 +167,8 @@ sub parse_groups {
             $previous_level = $level;
             push @{ $gref[-1] }, $group;
             $group = {};
+        } else {
+            $group->{'unknown'}->{$type} = substr($buffer, $pos, $size);
         }
         $pos += $size;
     }
@@ -188,32 +192,31 @@ sub parse_entries {
         if ($type == 1) {
             $entry->{'uuid'} = 1 #KpxUuid(pData);
         } elsif ($type == 2) {
-            $entry->{'group_id'} = unpack 'L', substr($buffer, $pos, 4);
+            $entry->{'group_id'}  = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 3) {
-            $entry->{'icon'} = unpack 'L', substr($buffer, $pos, 4);
+            $entry->{'icon'}      = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 4) {
-            $entry->{'title'} = substr($buffer, $pos, $size);
-            $entry->{'title'} =~ s/\0$//;
+            ($entry->{'title'}    = substr($buffer, $pos, $size)) =~ s/\0$//;
         } elsif ($type == 5) {
-            $entry->{'url'} = substr($buffer, $pos, $size);
-            $entry->{'url'} =~ s/\0$//;
+            ($entry->{'url'}      = substr($buffer, $pos, $size)) =~ s/\0$//;
         } elsif ($type == 6) {
-            $entry->{'username'} = substr($buffer, $pos, $size);
-            $entry->{'username'} =~ s/\0$//;
+            ($entry->{'username'} = substr($buffer, $pos, $size)) =~ s/\0$//;
         } elsif ($type == 7) {
-            $entry->{'password'} = substr($buffer, $pos, $size);
-            $entry->{'password'} =~ s/\0$//;
+            ($entry->{'password'} = substr($buffer, $pos, $size)) =~ s/\0$//;
         } elsif ($type == 8) {
-            $entry->{'comment'} = substr($buffer, $pos, $size);
-            $entry->{'comment'} =~ s/\0$//;
-	#case 0x0009:	entry->Creation=dateFromPackedStruct5(pData);
-	#case 0x000A:	entry->LastMod=dateFromPackedStruct5(pData);
-	#case 0x000B:	entry->LastAccess=dateFromPackedStruct5(pData);
-	#case 0x000C:	entry->Expire=dateFromPackedStruct5(pData);
-	} elsif ($type == 0x000D) {
-            $entry->{'binary_desc'} = substr($buffer, $pos, $size);
-	} elsif ($type == 0x000E) {
-            $entry->{'binary'} = substr($buffer, $pos, $size);
+            ($entry->{'comment'}  = substr($buffer, $pos, $size)) =~ s/\0$//;
+        } elsif ($type == 9) {
+            $entry->{'created'}   = $self->parse_date(substr($buffer, $pos, $size));
+        } elsif ($type == 0xA) {
+            $entry->{'modified'}  = $self->parse_date(substr($buffer, $pos, $size));
+        } elsif ($type == 0xB) {
+            $entry->{'accessed'}  = $self->parse_date(substr($buffer, $pos, $size));
+        } elsif ($type == 0xC) {
+            $entry->{'expires'}   = $self->parse_date(substr($buffer, $pos, $size));
+	} elsif ($type == 0xD) {
+            ($entry->{'bin_desc'} = substr($buffer, $pos, $size)) =~ s/\0$//;
+	} elsif ($type == 0xE) {
+            $entry->{'binary'}    = substr($buffer, $pos, $size);
         } elsif ($type == 0xFFFF) {
             $n_entries--;
             my $gid = delete $entry->{'group_id'};
@@ -243,9 +246,35 @@ sub parse_entries {
                 push @{ $ref->{'entries'} }, $entry;
             }
             $entry = {};
+        } else {
+            $entry->{'unknown'}->{$type} = substr($buffer, $pos, $size);
         }
         $pos += $size;
     }
+}
+
+sub parse_date {
+    my ($self, $packed) = @_;
+    my @b = unpack('C*', $packed);
+    my $year = ($b[0] << 6) | ($b[1] >> 2);
+    my $mon  = (($b[1] & 0b11)     << 2) | ($b[2] >> 6);
+    my $day  = (($b[2] & 0b111111) >> 1);
+    my $hour = (($b[2] & 0b1)      << 4) | ($b[3] >> 4);
+    my $min  = (($b[3] & 0b1111)   << 2) | ($b[4] >> 6);
+    my $sec  = (($b[4] & 0b111111));
+    return sprintf "%04d-%02d-%02d %02d:%02d:%02d", $year, $mon, $day, $hour, $min, $sec;
+}
+
+sub gen_date {
+    my ($self, $date) = @_;
+    my ($year, $mon, $day, $hour, $min, $sec) = $date =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/ ? ($1,$2,$3,$4,$5,$6) : die "Invalid date ($date)";
+    return pack('C*',
+                ($year >> 6) & 0b111111,
+                (($year & 0b111111) << 2) | (($mon >> 2) & 0b11),
+                (($mon & 0b11) << 6) | (($day & 0b11111) << 1) | (($hour >> 4) & 0b1),
+                (($hour & 0b1111) << 4) | (($min >> 2) & 0b1111),
+                (($min & 0b11) << 6) | ($sec & 0b111111),
+               );
 }
 
 ###----------------------------------------------------------------###
