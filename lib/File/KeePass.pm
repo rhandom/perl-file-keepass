@@ -39,8 +39,6 @@ sub load_db {
     read($fh, my $buffer, $total_size);
     close $fh;
     croak "Couldn't read entire file contents.\n" if length($buffer) != $total_size;
-    croak "File was smaller than db header ($total_size < ".DB_HEADER_SIZE().")\n" if $total_size < DB_HEADER_SIZE;
-
     return $self->parse_db($buffer, $pass);
 }
 
@@ -94,19 +92,12 @@ sub parse_db {
 
 sub parse_header {
     my ($self, $buffer) = @_;
-    return {
-        sig1       => unpack('L', substr($buffer,   0, 4)),
-        sig2       => unpack('L', substr($buffer,   4, 4)),
-        flags      => unpack('L', substr($buffer,   8, 4)),
-        ver        => unpack('L', substr($buffer,  12, 4)),
-        seed_rand  => substr($buffer, 16, 16),
-        enc_iv     => substr($buffer, 32, 16),
-        n_groups   => unpack('L', substr($buffer,  48, 4)),
-        n_entries  => unpack('L', substr($buffer,  52, 4)),
-        checksum   => substr($buffer, 56, 32),
-        seed_key   => substr($buffer, 88, 32),
-        seed_rot_n => unpack('L', substr($buffer, 120, 4)),
-    };
+    my $size = length($buffer);
+    croak "File was smaller than db header ($size < ".DB_HEADER_SIZE().")\n" if $size < DB_HEADER_SIZE;
+    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
+    my $t =   'L    L    L     L   A16       A16    L        L         A32      A32      L';
+    my %h; @h{@f} = unpack $t, $buffer;
+    return \%h;
 }
 
 sub parse_groups {
@@ -128,14 +119,13 @@ sub parse_groups {
         die "Group header offset is out of range. ($pos, $size)" if $pos + $size > length($buffer);
 
         if ($type == 1) {
-            $group->{'id'} = unpack 'L', substr($buffer, $pos, 4);
+            $group->{'id'}     = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 2) {
-            $group->{'title'} = substr($buffer, $pos, $size);
-            $group->{'title'} =~ s/\0$//;
+            ($group->{'title'} = substr($buffer, $pos, $size)) =~ s/\0$//;
         } elsif ($type == 7) {
-            $group->{'icon'} = unpack 'L', substr($buffer, $pos, 4);
+            $group->{'icon'}   = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 8) {
-            $group->{'level'} = unpack 'S', substr($buffer, $pos, 2);
+            $group->{'level'}  = unpack 'S', substr($buffer, $pos, 2);
         } elsif ($type == 0xFFFF) {
             $n_groups--;
             $gmap{$group->{'id'}} = $group;
@@ -250,6 +240,7 @@ sub parse_date {
 
 sub gen_date {
     my ($self, $date) = @_;
+    return "\0\0\0\0\0" if ! $date;
     my ($year, $mon, $day, $hour, $min, $sec) = $date =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/ ? ($1,$2,$3,$4,$5,$6) : die "Invalid date ($date)";
     return pack('C*',
                 ($year >> 6) & 0b111111,
@@ -274,8 +265,8 @@ sub gen_db {
         $head->{$key} = '';
         $head->{$key} .= chr(int(255 * rand())) for 1..16;
     }
-    $head->{'seed_key'}   = sha256(rand()) if ! defined $head->{'seed_key'};
-    $head->{'seed_rot_n'} = 50_000         if ! defined $head->{'seed_rot_n'};
+    $head->{'seed_key'}   = sha256(time.rand().$$) if ! defined $head->{'seed_key'};
+    $head->{'seed_rot_n'} = 50_000 if ! defined $head->{'seed_rot_n'};
 
     # use the headers to generate our encryption key in conjunction with the password
     my $key = sha256($pass);
@@ -285,37 +276,35 @@ sub gen_db {
     $key = sha256($head->{'seed_rand'}, $key);
 
     my $buffer = '';
-    my @entries;
     foreach my $g ($self->flat_groups($groups)) {
         $head->{'n_groups'}++;
-        my @d = ([1,      pack('LL', 4, $g->{'id'})],
+        my @d = ([1,      pack('LL', 4, $g->{'id'} || 0)],
                  [2,      pack('L', length($g->{'title'})+1)."$g->{'title'}\0"],
                  [7,      pack('LL', 4, $g->{'icon'}  || 0)],
                  [8,      pack('LS', 2, $g->{'level'} || 0)],
                  [0xFFFF, pack('L', 0)]);
         push @d, [$_, $g->{'unknown'}->{$_}] for keys %{ $g->{'unknown'} || {} };
         $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
-        push @entries, @{ $g->{'entries'} } if $g->{'entries'};
-    }
-    foreach my $e (@entries) {
-        $head->{'n_entries'}++;
-        my @d = ([1,      pack('LH*', length($e->{'uuid'})/2, $e->{'uuid'})],
-                 [2,      pack('LL', 4, $e->{'group_id'}  || 0)],
-                 [3,      pack('LL', 4, $e->{'icon'}  || 0)],
-                 [4,      pack('L', length($e->{'title'})+1)."$e->{'title'}\0"],
-                 [5,      pack('L', length($e->{'url'})+1).   "$e->{'url'}\0"],
-                 [6,      pack('L', length($e->{'username'})+1). "$e->{'username'}\0"],
-                 [7,      pack('L', length($e->{'password'})+1). "$e->{'password'}\0"],
-                 [8,      pack('L', length($e->{'comment'})+1).  "$e->{'comment'}\0"],
-                 [9,      pack('L', 5, $self->gen_date($e->{'created'}))],
-                 [0xA,    pack('L', 5, $self->gen_date($e->{'modified'}))],
-                 [0xB,    pack('L', 5, $self->gen_date($e->{'accessed'}))],
-                 [0xC,    pack('L', 5, $self->gen_date($e->{'expires'}))],
-                 [0xD,    pack('L', length($e->{'bin_desc'})+1)."$e->{'bin_desc'}\0"],
-                 [0xE,    pack('L', length($e->{'binary'})).$e->{'binary'}],
-                 [0xFFFF, pack('L', 0)]);
-        push @d, [$_, $e->{'unknown'}->{$_}] for keys %{ $e->{'unknown'} || {} };
-        $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
+        foreach my $e (@{ $g->{'entries'} || [] }) {
+            $head->{'n_entries'}++;
+            my @d = ([1,      pack('LH*', length($e->{'uuid'})/2, $e->{'uuid'})],
+                     [2,      pack('LL', 4, $g->{'id'}   || 0)],
+                     [3,      pack('LL', 4, $e->{'icon'} || 0)],
+                     [4,      pack('L', length($e->{'title'})+1)."$e->{'title'}\0"],
+                     [5,      pack('L', length($e->{'url'})+1).   "$e->{'url'}\0"],
+                     [6,      pack('L', length($e->{'username'})+1). "$e->{'username'}\0"],
+                     [7,      pack('L', length($e->{'password'})+1). "$e->{'password'}\0"],
+                     [8,      pack('L', length($e->{'comment'})+1).  "$e->{'comment'}\0"],
+                     [9,      pack('L', 5, $self->gen_date($e->{'created'}))],
+                     [0xA,    pack('L', 5, $self->gen_date($e->{'modified'}))],
+                     [0xB,    pack('L', 5, $self->gen_date($e->{'accessed'}))],
+                     [0xC,    pack('L', 5, $self->gen_date($e->{'expires'}))],
+                     [0xD,    pack('L', length($e->{'bin_desc'})+1)."$e->{'bin_desc'}\0"],
+                     [0xE,    pack('L', length($e->{'binary'})).$e->{'binary'}],
+                     [0xFFFF, pack('L', 0)]);
+            push @d, [$_, $e->{'unknown'}->{$_}] for keys %{ $e->{'unknown'} || {} };
+            $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
+        }
     }
 
     $head->{'checksum'} = sha256($buffer);
@@ -355,10 +344,10 @@ sub gen_header {
 sub dump_groups {
     my ($self, $g, $indent) = @_;
     $indent = '' if ! $indent;
-    print $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'}) $g->{'level'}\n";
+    print $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'})\n";
     $self->dump_groups($_, "$indent    ") for @{ $g->{'groups'} || [] };
     for my $e (@{ $g->{'entries'} || [] }) {
-        print "$indent    > $e->{'title'} ($e->{'username'})\n";
+        print "$indent    > $e->{'title'}\t($e->{'uuid'})\n";
     }
 }
 
@@ -367,14 +356,15 @@ sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
 sub header { shift->{'header'} || croak "No header loaded yet\n" }
 
 sub add_group {
-    my $self = shift;
-    my $args = shift;
+    my ($self, $args, $parent_group) = @_;
     my $groups;
     my $level;
-    if (defined(my $pid = $args->{'parent_id'})) {
-        if (my $group = $self->find_group({id => $pid})) {
-            $groups = $group->{'groups'} ||= [];
-            $level  = $group->{'level'} || 0;
+    $parent_group ||= delete $args->{'group'};
+    if (defined $parent_group) {
+        $parent_group = $self->find_group({id => $parent_group}) if ! ref($parent_group);
+        if ($parent_group) {
+            $groups = $parent_group->{'groups'} ||= [];
+            $level  = $parent_group->{'level'}  || 0;
             $level++;
         }
     }
@@ -388,17 +378,16 @@ sub add_group {
         title => defined($args->{'title'}) ? $args->{'title'} : '',
         icon  => $args->{'icon'} || 0,
         id    => $gid,
+        level => $level,
     };
 
     return $gid;
 }
 
 sub find_group {
-    my $self = shift;
-    my $args = shift;
+    my ($self, $args, $groups) = @_;
     die "Must specify one of id, title or icon" if !grep {defined $args->{$_}} qw(id title icon);
-    my $groups = shift || $self->groups;
-    for my $g (@$groups) {
+    for my $g (@{ $groups || $self->groups}) {
         if (   (!defined $args->{'id'}    || $g->{'id'}    eq $args->{'id'})
             && (!defined $args->{'title'} || $g->{'title'} eq $args->{'title'})
             && (!defined $args->{'icon'}  || $g->{'icon'}  eq $args->{'icon'})) {
@@ -422,15 +411,50 @@ sub flat_groups {
     return @GROUPS;
 }
 
+###----------------------------------------------------------------###
+
+sub add_entry {
+    my ($self, $args, $group) = @_;
+    $args = {%$args};
+    $group ||= delete($args->{'group'}) || $self->groups->[0] || $self->add_group({});
+    if (! ref($group)) {
+        $group = $self->find_group({id => $group}) || croak "Couldn't find a matching group to add entry to";
+    }
+
+    $args->{$_} = '' for grep {!defined $args->{$_}} qw(title url username password comment bin_desc binary);
+    $args->{$_} = 0  for grep {!defined $args->{$_}} qw(id icon);
+    $args->{'uuid'} = unpack 'H32', sha256(time.rand().$$) while !$args->{'uuid'} || $self->find_entries({uuid => $args->{'uuid'}});
+
+    push @{ $group->{'entries'} ||= [] }, $args;
+    return $args->{'uuid'};
+}
+
+sub flat_entries {
+    my $self = shift;
+    return (map { @{ $_->{'entries'} || [] } } $self->flat_groups);
+}
+
 sub active_entries {
     my $self = shift;
-    my @entries;
     my ($sec, $min, $hour, $day, $mon, $year) = localtime;
     my $now = sprintf '%04d-%02d-%02d %02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
-    for my $g ($self->flat_groups) {
-        push @entries, grep {!$_->{'expires'} || $_->{'expires'} ge $now} @{ $g->{'entries'} || [] };
+    return (grep {!$_->{'expires'} || $_->{'expires'} ge $now} $self->flat_entries);
+}
+
+sub find_entries {
+    my ($self, $args) = @_;
+    my @entries;
+    foreach my $g ($self->flat_groups) {
+        foreach my $e (@{ $g->{'entries'} || [] }) {
+            next if defined $args->{'group_id'} && (!defined($g->{'id'})       ||  $g->{'id'}       ne $args->{'group_id'});
+            next if defined $args->{'title'}    && (!defined($e->{'title'})    ||  $e->{'title'}    ne $args->{'title'});
+            next if defined $args->{'username'} && (!defined($e->{'username'}) ||  $e->{'username'} ne $args->{'username'});
+            next if defined $args->{'url'}      && (!defined($e->{'url'})      ||  $e->{'url'}      ne $args->{'url'});
+            next if defined $args->{'uuid'}     && (!defined($e->{'uuid'})     ||  $e->{'uuid'}     ne $args->{'uuid'});
+            push @entries, $e;
+        }
     }
-    return \@entries;
+    return @entries;
 }
 
 ###----------------------------------------------------------------###
