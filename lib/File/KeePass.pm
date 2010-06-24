@@ -354,10 +354,25 @@ sub gen_db {
 
     my $buffer  = '';
     my $entries = '';
-    foreach my $g ($self->flat_groups($groups)) {
+    my @g = $self->find_groups({}, $groups);
+    if (grep {$_->{'expanded'}} @g) {
+        my $e = ($self->find_entries({title => 'Meta-Info', username => 'SYSTEM', comment => 'KPX_GROUP_TREE_STATE', url => '$'}))[0] || do {
+            my $uuid = $self->add_entry({
+                comment  => 'KPX_GROUP_TREE_STATE',
+                title    => 'Meta-Info',
+                username => 'SYSTEM',
+                url      => '$',
+                uuid     => '00000000000000000000000000000000',
+            }, $g[0]);
+            $self->find_entry({uuid => $uuid});
+        };
+        $e->{'bin_desc'} = 'bin-stream';
+        $e->{'binary'} = pack 'L', scalar(@g);
+        $e->{'binary'} .= pack('LC', $_->{'id'}, $_->{'expanded'} ? 1 : 0) for @g;
+    }
+    foreach my $g (@g) {
         $head->{'n_groups'}++;
-        $g->{'id'} = int((2**32-1) * rand()) if ! defined $g->{'id'};
-        my @d = ([1,      pack('LL', 4, $g->{'id'} || 0)],
+        my @d = ([1,      pack('LL', 4, $g->{'id'})],
                  [2,      pack('L', length($g->{'title'})+1)."$g->{'title'}\0"],
                  [7,      pack('LL', 4, $g->{'icon'}  || 0)],
                  [8,      pack('LS', 2, $g->{'level'} || 0)],
@@ -417,9 +432,13 @@ sub gen_header {
 
 sub dump_groups {
     my ($self, $g, $indent) = @_;
+    if (! $g) {
+        $self->dump_groups($_) for @{ $self->groups };
+        return;
+    }
     $indent = '' if ! $indent;
     print $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'})\n";
-    $self->dump_groups($_, "$indent    ") for @{ $g->{'groups'} || [] };
+    $self->dump_groups($_, "$indent    ") for grep {$_} @{ $g->{'groups'} || [] };
     for my $e (@{ $g->{'entries'} || [] }) {
         print "$indent    > $e->{'title'}\t($e->{'uuid'})\n";
     }
@@ -431,60 +450,43 @@ sub header { shift->{'header'} || croak "No header loaded yet\n" }
 
 sub add_group {
     my ($self, $args, $parent_group, $top_groups) = @_;
+    $args = {%$args};
     my $groups;
-    my $level;
     $parent_group ||= delete $args->{'group'};
     if (defined $parent_group) {
         $parent_group = $self->find_group({id => $parent_group}, $top_groups) if ! ref($parent_group);
-        if ($parent_group) {
-            $groups = $parent_group->{'groups'} ||= [];
-            $level  = $parent_group->{'level'}  || 0;
-            $level++;
-        }
+        $groups = $parent_group->{'groups'} ||= [] if $parent_group;
     }
     $groups ||= $top_groups || ($self->{'groups'} ||= []);
-    $level  ||= 0;
 
-    my $gid;
-    $gid = int((2**32-1) * rand()) while !$gid || $self->find_group({id => $gid});
-
-    push @$groups, {
-        title => defined($args->{'title'}) ? $args->{'title'} : '',
-        icon  => $args->{'icon'} || 0,
-        id    => $gid,
-        level => $level,
-    };
-
-    return $gid;
+    $args->{'title'} = '' if ! defined $args->{'title'};
+    $args->{'icon'} ||= 0;
+    push @$groups, $args;
+    $self->find_groups({}, $groups); # sets level and gid
+    return $args->{'id'};
 }
 
-sub find_group {
-    my ($self, $args, $groups) = @_;
-    die "Must specify one of id, title or icon" if !grep {defined $args->{$_}} qw(id title icon);
+sub find_groups {
+    my ($self, $args, $groups, $level) = @_;
+    my @groups;
     for my $g (@{ $groups || $self->groups}) {
+        $g->{'level'} = $level || 0;
+        $g->{'id'} = int((2**32-1) * rand()) if ! defined $g->{'id'};
         if (   (!defined $args->{'id'}    || $g->{'id'}    eq $args->{'id'})
             && (!defined $args->{'title'} || $g->{'title'} eq $args->{'title'})
             && (!defined $args->{'icon'}  || $g->{'icon'}  eq $args->{'icon'})) {
-            return $g;
+            push @groups, $g;
         }
-        next if ! $g->{'groups'};
-        my $found = $self->find_group($args, $g->{'groups'});
-        return $found if $found;
+        push @groups, $self->find_groups($args, $g->{'groups'}, $g->{'level'} + 1) if $g->{'groups'};
     }
-    return;
+    return @groups;
 }
 
-sub flat_groups {
-    my $self   = shift;
-    my $groups = shift || $self->groups;
-    my $level  = shift || 0;
-    my @GROUPS;
-    for my $g (@$groups) {
-        $g->{'level'} = $level;
-        push @GROUPS, $g;
-        push @GROUPS, $self->flat_groups($g->{'groups'}, $level + 1) if $g->{'groups'};
-    }
-    return @GROUPS;
+sub find_group {
+    my $self = shift;
+    my @g = $self->find_groups(@_);
+    croak "Found too many groups (@g)" if @g > 1;
+    return $g[0];
 }
 
 ###----------------------------------------------------------------###
@@ -509,32 +511,18 @@ sub add_entry {
     return $args->{'uuid'};
 }
 
-sub flat_entries {
-    my $self = shift;
-    return (map { @{ $_->{'entries'} || [] } } $self->flat_groups(@_));
-}
-
-sub active_entries {
-    my $self = shift;
-    my $now  = $self->now;
-    return (grep {!$_->{'expires'} || $_->{'expires'} ge $now} $self->flat_entries(@_));
-}
-
-sub now {
-    my ($sec, $min, $hour, $day, $mon, $year) = localtime;
-    return sprintf '%04d-%02d-%02d %02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
-}
-
 sub find_entries {
     my ($self, $args, $groups) = @_;
     my @entries;
-    foreach my $g ($self->flat_groups($groups)) {
+    foreach my $g ($self->find_groups({}, $groups)) {
         foreach my $e (@{ $g->{'entries'} || [] }) {
             next if defined $args->{'group_id'} && (!defined($g->{'id'})       ||  $g->{'id'}       ne $args->{'group_id'});
             next if defined $args->{'title'}    && (!defined($e->{'title'})    ||  $e->{'title'}    ne $args->{'title'});
             next if defined $args->{'username'} && (!defined($e->{'username'}) ||  $e->{'username'} ne $args->{'username'});
             next if defined $args->{'url'}      && (!defined($e->{'url'})      ||  $e->{'url'}      ne $args->{'url'});
             next if defined $args->{'uuid'}     && (!defined($e->{'uuid'})     ||  $e->{'uuid'}     ne $args->{'uuid'});
+            next if defined $args->{'comment'}  && (!defined($e->{'comment'})  ||  $e->{'comment'}  ne $args->{'comment'});
+            next if $args->{'active'} && (!$e->{'expires'} || $e->{'expires'} le $self->now);
             push @entries, $e;
         }
     }
@@ -546,6 +534,11 @@ sub find_entry {
     my @e = $self->find_entries(@_);
     croak "Found too many entries (@e)" if @e > 1;
     return $e[0];
+}
+
+sub now {
+    my ($sec, $min, $hour, $day, $mon, $year) = localtime;
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
 }
 
 ###----------------------------------------------------------------###
@@ -567,7 +560,7 @@ sub lock {
         $ref->{$key} .= chr(int(255 * rand())) for 1..16;
     }
 
-    foreach my $e ($self->flat_entries($groups)) {
+    foreach my $e ($self->find_entries({}, $groups)) {
         my $pass = delete $e->{'password'}; $pass = '' if ! defined $pass;
         $ref->{"$e"} = $self->encrypt_rijndael_cbc($pass, $ref->{'_key'}, $ref->{'_enc_iv'}); # we don't leave plaintext in memory
     }
@@ -580,7 +573,7 @@ sub unlock {
     my $groups = shift || $self->groups;
     return 2 if !$locker{"$groups"};
     my $ref = $locker{"$groups"};
-    foreach my $e ($self->flat_entries($groups)) {
+    foreach my $e ($self->find_entries({}, $groups)) {
         my $pass = $ref->{"$e"};
         $pass = eval { $self->decrypt_rijndael_cbc($pass, $ref->{'_key'}, $ref->{'_enc_iv'}) } if $pass;
         $pass = '' if ! defined $pass;
