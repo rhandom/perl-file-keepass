@@ -115,9 +115,9 @@ sub parse_db {
     } else {
         die "Unimplemented enc_type $enc_type";
     }
-    die "Decryption failed.\nThe key is wrong or the file is damaged."
+    croak "Decryption failed.\nThe key is wrong or the file is damaged.\n"
         if $crypto_size > 2**31 || (!$crypto_size && $head->{'n_groups'});
-    die "Checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)"
+    croak "Checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)\n"
         if $head->{'checksum'} ne sha256($buffer);
 
     # read the db
@@ -407,19 +407,19 @@ sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
 sub header { shift->{'header'} || croak "No header loaded yet\n" }
 
 sub add_group {
-    my ($self, $args, $parent_group) = @_;
+    my ($self, $args, $parent_group, $top_groups) = @_;
     my $groups;
     my $level;
     $parent_group ||= delete $args->{'group'};
     if (defined $parent_group) {
-        $parent_group = $self->find_group({id => $parent_group}) if ! ref($parent_group);
+        $parent_group = $self->find_group({id => $parent_group}, $top_groups) if ! ref($parent_group);
         if ($parent_group) {
             $groups = $parent_group->{'groups'} ||= [];
             $level  = $parent_group->{'level'}  || 0;
             $level++;
         }
     }
-    $groups ||= $self->{'groups'} ||= [];
+    $groups ||= $top_groups || ($self->{'groups'} ||= []);
     $level  ||= 0;
 
     my $gid;
@@ -465,18 +465,20 @@ sub flat_groups {
 ###----------------------------------------------------------------###
 
 sub add_entry {
-    my ($self, $args, $group) = @_;
+    my ($self, $args, $group, $groups) = @_;
+    $groups ||= $self->groups;
+    croak "You must unlock the passwords before adding new entries.\n" if $self->is_locked($groups);
     $args = {%$args};
-    $group ||= delete($args->{'group'}) || $self->groups->[0] || $self->add_group({});
+    $group ||= delete($args->{'group'}) || $groups->[0] || $self->add_group({});
     if (! ref($group)) {
-        $group = $self->find_group({id => $group}) || croak "Couldn't find a matching group to add entry to";
+        $group = $self->find_group({id => $group}, $groups) || croak "Couldn't find a matching group to add entry to";
     }
 
     $args->{$_} = ''         for grep {!defined $args->{$_}} qw(title url username password comment bin_desc binary);
     $args->{$_} = 0          for grep {!defined $args->{$_}} qw(id icon);
     $args->{$_} = $self->now for grep {!defined $args->{$_}} qw(created accessed modified);;
     $args->{'expires'} ||= '2999-12-31 23:23:59';
-    $args->{'uuid'} = unpack 'H32', sha256(time.rand().$$) while !$args->{'uuid'} || $self->find_entries({uuid => $args->{'uuid'}});
+    $args->{'uuid'} = unpack 'H32', sha256(time.rand().$$) while !$args->{'uuid'} || $self->find_entries({uuid => $args->{'uuid'}}, $groups);
 
     push @{ $group->{'entries'} ||= [] }, $args;
     return $args->{'uuid'};
