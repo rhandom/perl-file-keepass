@@ -94,8 +94,9 @@ sub parse_header {
     my ($self, $buffer) = @_;
     my $size = length($buffer);
     croak "File was smaller than db header ($size < ".DB_HEADER_SIZE().")\n" if $size < DB_HEADER_SIZE;
+
     my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
-    my $t =   'L    L    L     L   A16       A16    L        L         A32      A32      L';
+    my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
     my %h; @h{@f} = unpack $t, $buffer;
     return \%h;
 }
