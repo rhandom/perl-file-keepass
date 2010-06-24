@@ -1,14 +1,10 @@
-#!/usr/bin/perl
+package File::KeePass;
 
 =head1 NAME
 
 File::KeePass - Interface to KeePass V1 database files
 
 =cut
-
-File::KeePass::run(),exit if $0 eq __FILE__;
-
-package File::KeePass;
 
 use strict;
 use warnings;
@@ -31,17 +27,6 @@ our $VERSION = '0.01';
 sub new {
     my $class = shift;
     return bless {}, $class;
-}
-
-sub run {
-    my $self = ref($_[0]) ? shift() : __PACKAGE__->new;
-    my $file = shift || shift(@ARGV) || croak "Usage: $0 file.kdb\n";
-    my $pass = shift || shift(@ARGV) || do { require IO::Prompt; ''.IO::Prompt::prompt("Enter your master key: ", -e => '*') };
-    $self->load_db($file, $pass);
-#    debug $self->groups;
-#    exit;
-    my $gen = $self->gen_db($pass, $self->groups, $self->header);
-    $self->dump_groups($_) for @{ $self->groups };
 }
 
 sub load_db {
@@ -435,6 +420,17 @@ sub flat_groups {
         push @GROUPS, $self->flat_groups($g->{'groups'}) if $g->{'groups'};
     }
     return @GROUPS;
+}
+
+sub active_entries {
+    my $self = shift;
+    my @entries;
+    my ($sec, $min, $hour, $day, $mon, $year) = localtime;
+    my $now = sprintf '%04d-%02d-%02d %02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
+    for my $g ($self->flat_groups) {
+        push @entries, grep {!$_->{'expires'} || $_->{'expires'} ge $now} @{ $g->{'entries'} || [] };
+    }
+    return \@entries;
 }
 
 ###----------------------------------------------------------------###
