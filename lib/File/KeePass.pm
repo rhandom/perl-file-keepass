@@ -62,14 +62,23 @@ sub save_db {
     open(my $fh, '>', $tmp) || croak "Couldn't open $tmp: $!\n";
     print $fh $buf;
     close $fh;
-    croak "Written file size of $tmp didn't match - not moving into place";
+    if (-s $tmp ne length($buf)) {
+        croak "Written file size of $tmp didn't match (".(-s $tmp)." != ".length($buf).") - not moving into place\n";
+        unlink($tmp);
+    }
 
     # try to move the file into place
     if (-e $bak) {
-        unlink($bak) || croak "Couldn't removing already existing backup $bak: $!\n";
+        if (!unlink($bak)) {
+            unlink($tmp);
+            croak "Couldn't removing already existing backup $bak: $!\n";
+        }
     }
     if (-e $file) {
-        rename($file, $bak) || croak "Couldn't backup $file to $bak: $!\n";
+        if (!rename($file, $bak)) {
+            unlink($tmp);
+            croak "Couldn't backup $file to $bak: $!\n";
+        }
     }
     rename($tmp, $file) || croak "Couldn't move $tmp to $file: $!\n";
     if (!$self->{'keep_backup'} && -e $bak) {
@@ -77,6 +86,13 @@ sub save_db {
     }
 
     return 1;
+}
+
+sub clear {
+    my $self = shift;
+    $self->unlock;
+    delete $self->{'groups'};
+    delete $self->{'header'};
 }
 
 ###----------------------------------------------------------------###
