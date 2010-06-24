@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 35;
+use Test::More tests => 46;
 
 use_ok('File::KeePass');
 
@@ -23,6 +23,7 @@ ok(!eval { $obj->header }, "No header until we do something");
 my $g_id = $obj->add_group({
     title => 'Foo',
     icon  => 1,
+    expanded => 1,
 });
 ok($g_id, "Could add a group");
 ok($obj->groups, "Now we have groups");
@@ -31,8 +32,8 @@ ok(my $g = $obj->find_group({id => $g_id}), "Found a group");
 is($g->{'title'}, 'Foo', "Was the same group");
 
 my $g_id2 = $obj->add_group({
-    title => 'Bar',
-    group => $g_id,
+    title    => 'Bar',
+    group    => $g_id,
 });
 ok(my $g2 = $obj->find_group({id => $g_id2}), "Found a child group");
 is($g2->{'title'}, 'Bar', "Was the same group");
@@ -45,6 +46,11 @@ my $e_uuid2 = $obj->add_entry({title => 'bim', username => 'BIM'});
 my @e = $obj->find_entries({title => 'bam'});
 is(scalar(@e), 1, "Found one entry");
 is($e[0]->{'uuid'}, $e_uuid, "Is the right one");
+
+ok(!eval { $obj->locked_entry_password($e[0]) }, 'Can unlock unlocked password');
+
+@e = $obj->find_entries({active => 1});
+is(scalar(@e), 2, "Found right number of active entries");
 
 ###----------------------------------------------------------------###
 
@@ -98,17 +104,31 @@ ok($obj->is_locked, "Object is auto locked");
 $obj->unlock;
 my $file = __FILE__.".kdb";
 
-$obj->save_db($file, $pass);
+ok(!eval { $obj->save_db }, "Missing file");
+ok(!eval { $obj->save_db($file) }, "Missing pass");
+ok($obj->save_db($file, $pass), "Saved DB");
 ok(-e $file, "File now exists");
+{
+    local $obj->{'keep_backup'} = 1;
+    ok($obj->save_db($file, $pass), "Saved over the top but kept backup");
+}
+ok($obj->save_db($file, $pass), "Saved over the top");
 $obj->clear;
 ok(!eval { $obj->groups }, "Cleared out object");
 
+ok(!eval { $obj->load_db }, "Missing file");
+ok(!eval { $obj->load_db($file) }, "Missing pass");
 ok($obj->load_db($file, $pass), "Loaded from file");
 
 ok($g = $obj->find_group({id => $g_id}), "Found a group in parsed results");
 is($g->{'title'}, 'Foo', "Was the correct group");
+ok($g->{'expanded'}, "Expanded was passed along correctly");
 
 unlink($file);
 unlink("$file.bak");
 
 ###----------------------------------------------------------------###
+
+my $dump = eval { $obj->dump_groups };
+diag($dump);
+ok($dump, "Ran dump groups");

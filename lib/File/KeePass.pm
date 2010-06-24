@@ -26,7 +26,7 @@ my %locker;
 
 sub new {
     my $class = shift;
-    return bless {}, $class;
+    return bless {@_}, $class;
 }
 
 sub auto_lock {
@@ -123,9 +123,9 @@ sub parse_db {
         die "Unimplemented enc_type $enc_type";
     }
 
-    croak "Decryption failed.\nThe key is wrong or the file is damaged.\n"
+    croak "The file could not be decrypted either because the key is wrong or the file is damaged.\n"
         if length($buffer) > 2**31 || (!length($buffer) && $head->{'n_groups'});
-    croak "Checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)\n"
+    croak "The file checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)\n"
         if $head->{'checksum'} ne sha256($buffer);
 
     # read the db
@@ -432,16 +432,18 @@ sub gen_header {
 
 sub dump_groups {
     my ($self, $g, $indent) = @_;
+    my $t = '';
     if (! $g) {
-        $self->dump_groups($_) for @{ $self->groups };
-        return;
+        $t .= $self->dump_groups($_) for @{ $self->groups };
+        return $t;
     }
     $indent = '' if ! $indent;
-    print $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'})\n";
-    $self->dump_groups($_, "$indent    ") for grep {$_} @{ $g->{'groups'} || [] };
+    $t .= $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'})\n";
+    $t .= $self->dump_groups($_, "$indent    ") for grep {$_} @{ $g->{'groups'} || [] };
     for my $e (@{ $g->{'entries'} || [] }) {
-        print "$indent    > $e->{'title'}\t($e->{'uuid'})\n";
+        $t .= "$indent    > $e->{'title'}\t($e->{'uuid'})\n";
     }
+    return $t;
 }
 
 sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
@@ -603,5 +605,172 @@ sub locked_entry_password {
 __END__
 
 =head1 SYNOPSIS
+
+    use File::KeePass;
+    use Data::Dumper qw(Dumper);
+
+    my $k = File::KeePass->new;
+    if (! eval { $k->load_db($file, $master_pass) }) {
+        die "Couldn't load the file $file: $@";
+    }
+
+    print Dumper $k->groups; # passwords are locked
+
+    $k->unlock;
+    print Dumper $k->groups; # passwords are now visible
+
+    $k->clear; # delete current db from memory
+
+
+    my $gid = $k->add_group({
+        title => 'Foo',
+    }); # root level group
+
+    my $gid2 = $k->add_group({
+        title => 'Bar',
+        group => $gid,
+    }); # nested group
+
+    my $group = $k->find_group({id => $gid});
+    # OR
+    my $group = $k->find_group({title => 'Foo'});
+
+    my $uuid = $k->add_entry({
+        title    => 'Something',
+        username => 'someuser',
+        password => 'somepass',
+        group    => $gid,
+    });
+
+    my $e = $k->find_entry({uuid => $uuid});
+    # OR
+    my $e = $k->find_entry({title => 'Something'});
+
+    $k->lock;
+    print $e->{'password'}; # eq undef
+    print $k->locked_entry_password($e); # eq 'somepass'
+
+    $k->unlock;
+    print $e->{'password'}; # eq 'somepass'
+
+
+    $k->save_db("/some/file/location.kdb", $master_pass);
+
+=head1 METHODS
+
+=over 4
+
+=item new
+
+Returns a new File::KeePass object.  Any named arguments are added to self.
+
+=item auto_lock
+
+Default true.  If true, passwords are automatically hidden when a database loaded
+via parse_db or load_db.
+
+    $k->auto_lock(0); # turn off auto locking
+
+=item load_db
+
+Takes a kdb filename and a master password.  Returns true on success.  Errors die.
+The resulting database can be accessed via various methods including $k->groups.
+
+=item save_db
+
+Takes a kdb filename and a master password.  Stores out the current groups in the object.
+Writes attempt to write first to $file.new.$epoch and are then renamed into the correct
+location.
+
+=item clear
+
+Clears any currently loaded groups database.
+
+=item parse_db
+
+Takes an encrypted kdb database and a master password.  Returns true on success.  Errors die.
+The resulting database can be accessed via various methods including $k->groups.
+
+=item parse_header
+
+Used by parse_db.
+
+=item parse_groups
+
+Used by parse_db.
+
+=item parse_entries
+
+Used by parse_db.
+
+=item parse_date
+
+Parses a kdb packed date.
+
+=item decrypt_rijndael_cbc
+
+Takes an encrypted string, a key, and an encryption_iv string.  Returns a plaintext string.
+
+=item encrypt_rijndael_cbc
+
+Takes a plaintext string, a key, and an encryption_iv string.  Returns an encrypted string.
+
+=item gen_db
+
+Takes a master password.  Optionally takes a "groups" arrayref and a "headers" hashref.
+If groups are not passed, it defaults to using the currently loaded groups.  If headers are
+not passed, a fresh set of headers are generated based on the groups and the master password.
+The headers can be passed in to test round trip portability.
+
+=item gen_header
+
+Returns a kdb file header.
+
+=item gen_date
+
+Returns a kdb packed date.
+
+=item dump_groups
+
+Prints
+
+=item groups
+=item header
+=item add_group
+=item find_groups
+=item find_group
+=item add_entry
+=item find_entries
+=item find_entry
+=item now
+=item is_locked
+=item lock
+=item unlock
+=item locked_entry_password
+
+=back
+
+=head1 BUGS
+
+Only Rijndael is supported.
+
+Only passkeys are supported (no key files).
+
+=head1 SOURCES
+
+Knowledge about the KeePass DB v1 format was gleaned from the source code of keepassx-0.4.3.  That
+source code is published under the GPL2 license.  KeePassX 0.4.3 bears the copyright of
+    Copyright (C) 2005-2008 Tarek Saidi <tarek.saidi@arcor.de>
+    Copyright (C) 2007-2009 Felix Geyer <debfx-keepassx {at} fobos.de>
+The encryption/decryption algorithms of File::KeePass are of derivative nature from KeePassX and could
+not have been created without this insight - though the perl code is from scratch.
+
+=head1 AUTHOR
+
+Paul Seamons <paul at seamons dot com>
+
+=head1 LICENSE
+
+This module may be distributed under the same terms as Perl itself.
 
 =cut
