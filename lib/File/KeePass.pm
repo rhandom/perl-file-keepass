@@ -356,6 +356,7 @@ sub gen_db {
     my $entries = '';
     foreach my $g ($self->flat_groups($groups)) {
         $head->{'n_groups'}++;
+        $g->{'id'} = int((2**32-1) * rand()) if ! defined $g->{'id'};
         my @d = ([1,      pack('LL', 4, $g->{'id'} || 0)],
                  [2,      pack('L', length($g->{'title'})+1)."$g->{'title'}\0"],
                  [7,      pack('LL', 4, $g->{'icon'}  || 0)],
@@ -474,12 +475,14 @@ sub find_group {
 }
 
 sub flat_groups {
-    my $self = shift;
+    my $self   = shift;
     my $groups = shift || $self->groups;
+    my $level  = shift || 0;
     my @GROUPS;
     for my $g (@$groups) {
+        $g->{'level'} = $level;
         push @GROUPS, $g;
-        push @GROUPS, $self->flat_groups($g->{'groups'}) if $g->{'groups'};
+        push @GROUPS, $self->flat_groups($g->{'groups'}, $level + 1) if $g->{'groups'};
     }
     return @GROUPS;
 }
@@ -557,21 +560,31 @@ sub lock {
     my $self = shift;
     my $groups = shift || $self->groups;
     return 2 if $locker{"$groups"}; # not quite as fast as Scalar::Util::refaddr
+
     my $ref = $locker{"$groups"} = {};
-    foreach my $e ($self->flat_entries($groups)) {
-        $ref->{"$e"} = delete $e->{'password'};
+    foreach my $key (qw(_key _enc_iv)) {
+        $ref->{$key} = '';
+        $ref->{$key} .= chr(int(255 * rand())) for 1..16;
     }
+
+    foreach my $e ($self->flat_entries($groups)) {
+        my $pass = delete $e->{'password'}; $pass = '' if ! defined $pass;
+        $ref->{"$e"} = $self->encrypt_rijndael_cbc($pass, $ref->{'_key'}, $ref->{'_enc_iv'}); # we don't leave plaintext in memory
+    }
+
     return 1;
 }
 
 sub unlock {
     my $self = shift;
     my $groups = shift || $self->groups;
-    return 2 if !$locker{"$groups"}; # not quite as fast as Scalar::Util::refaddr
+    return 2 if !$locker{"$groups"};
     my $ref = $locker{"$groups"};
     foreach my $e ($self->flat_entries($groups)) {
-        $e->{'password'} = $ref->{"$e"};
-        $e->{'password'} = '' if ! defined $e->{'password'};
+        my $pass = $ref->{"$e"};
+        $pass = eval { $self->decrypt_rijndael_cbc($pass, $ref->{'_key'}, $ref->{'_enc_iv'}) } if $pass;
+        $pass = '' if ! defined $pass;
+        $e->{'password'} = $pass;
     }
     delete $locker{"$groups"};
     return 1;
@@ -585,6 +598,8 @@ sub locked_entry_password {
     $entry = $self->find_entry({uuid => $entry}, $groups) if ! ref $entry;
     return if ! $entry;
     my $pass = $ref->{"$entry"};
+    $pass = eval { $self->decrypt_rijndael_cbc($pass, $ref->{'_key'}, $ref->{'_enc_iv'}) } if $pass;
+    $pass = '' if ! defined $pass;
     return $pass;
 }
 
