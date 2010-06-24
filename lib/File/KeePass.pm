@@ -11,16 +11,15 @@ use warnings;
 use Carp qw(croak);
 use Crypt::Rijndael;
 use Digest::SHA qw(sha256);
-use CGI::Ex::Dump qw(debug);
 
-use constant DB_HEADER_SIZE    => 124;
-use constant PWM_DBSIG_1       => 0x9AA2D903;
-use constant PWM_DBSIG_2       => 0xB54BFB65;
-use constant PWM_DBVER_DW      => 0x00030002;
-use constant PWM_FLAG_SHA2     => 1;
-use constant PWM_FLAG_RIJNDAEL => 2;
-use constant PWM_FLAG_ARCFOUR  => 4;
-use constant PWM_FLAG_TWOFISH  => 8;
+use constant DB_HEADER_SIZE   => 124;
+use constant DB_SIG_1         => 0x9AA2D903;
+use constant DB_SIG_2         => 0xB54BFB65;
+use constant DB_VER_DW        => 0x00030002;
+use constant DB_FLAG_SHA2     => 1;
+use constant DB_FLAG_RIJNDAEL => 2;
+use constant DB_FLAG_ARCFOUR  => 4;
+use constant DB_FLAG_TWOFISH  => 8;
 
 our $VERSION = '0.01';
 my %locker;
@@ -102,11 +101,11 @@ sub parse_db {
 
     # parse and verify headers
     my $head = $self->parse_header($buffer);
-    die "Wrong sig1 ($head->{'sig1'} != ".PWM_DBSIG_1().")\n" if $head->{'sig1'} != PWM_DBSIG_1;
-    die "Wrong sig2 ($head->{'sig2'} != ".PWM_DBSIG_2().")\n" if $head->{'sig2'} != PWM_DBSIG_2;
-    die "Unsupported File version ($head->{'ver'}).\n" if $head->{'ver'} & 0xFFFFFF00 != PWM_DBVER_DW & 0xFFFFFF00;
-    my $enc_type = ($head->{'flags'} & PWM_FLAG_RIJNDAEL) ? 'rijndael'
-                 : ($head->{'flags'} & PWM_FLAG_TWOFISH)  ? 'twofish'
+    die "Wrong sig1 ($head->{'sig1'} != ".DB_SIG_1().")\n" if $head->{'sig1'} != DB_SIG_1;
+    die "Wrong sig2 ($head->{'sig2'} != ".DB_SIG_2().")\n" if $head->{'sig2'} != DB_SIG_2;
+    die "Unsupported File version ($head->{'ver'}).\n" if $head->{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
+    my $enc_type = ($head->{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
+                 : ($head->{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
                  : die "Unknown encryption type\n";
 
     # use the headers to generate our encryption key in conjunction with the password
@@ -380,10 +379,10 @@ sub gen_db {
     my $extra = (16 - length($buffer) % 16) || 16; # always pad so we can always trim
     $buffer .= chr($extra) for 1 .. $extra;
 
-    local $head->{'sig1'}  = PWM_DBSIG_1();
-    local $head->{'sig2'}  = PWM_DBSIG_2();
-    local $head->{'flags'} = PWM_FLAG_RIJNDAEL();
-    local $head->{'ver'}   = PWM_DBVER_DW();
+    local $head->{'sig1'}  = DB_SIG_1();
+    local $head->{'sig2'}  = DB_SIG_2();
+    local $head->{'flags'} = DB_FLAG_RIJNDAEL();
+    local $head->{'ver'}   = DB_VER_DW();
     my $header = $self->gen_header($head);
     my $enc    = $cipher->encrypt($buffer);
 
