@@ -23,11 +23,20 @@ use constant PWM_FLAG_ARCFOUR  => 4;
 use constant PWM_FLAG_TWOFISH  => 8;
 
 our $VERSION = '0.01';
+my %locker;
 
 sub new {
     my $class = shift;
     return bless {}, $class;
 }
+
+sub auto_lock {
+    my $self = shift;
+    $self->{'auto_lock'} = shift if @_;
+    return !exists($self->{'auto_lock'}) || $self->{'auto_lock'};
+}
+
+###----------------------------------------------------------------###
 
 sub load_db {
     my $self = shift;
@@ -35,12 +44,42 @@ sub load_db {
     my $pass = shift || croak "Missing pass\n";
 
     open(my $fh, '<', $file) || croak "Couldn't open $file: $!\n";
-    my $total_size = -s $file;
-    read($fh, my $buffer, $total_size);
+    my $size = -s $file;
+    read($fh, my $buffer, $size);
     close $fh;
-    croak "Couldn't read entire file contents.\n" if length($buffer) != $total_size;
+    croak "Couldn't read entire file contents of $file.\n" if length($buffer) != $size;
     return $self->parse_db($buffer, $pass);
 }
+
+sub save_db {
+    my $self = shift;
+    my $file = shift || croak "Missing file\n";
+    my $pass = shift || croak "Missing pass\n";
+
+    my $buf = $self->gen_db($pass);
+    my $bak = "$file.bak";
+    my $tmp = "$file.new.".int(time());
+    open(my $fh, '>', $tmp) || croak "Couldn't open $tmp: $!\n";
+    print $fh $buf;
+    close $fh;
+    croak "Written file size of $tmp didn't match - not moving into place";
+
+    # try to move the file into place
+    if (-e $bak) {
+        unlink($bak) || croak "Couldn't removing already existing backup $bak: $!\n";
+    }
+    if (-e $file) {
+        rename($file, $bak) || croak "Couldn't backup $file to $bak: $!\n";
+    }
+    rename($tmp, $file) || croak "Couldn't move $tmp to $file: $!\n";
+    if (!$self->{'keep_backup'} && -e $bak) {
+        unlink($bak) || croak "Couldn't removing temporary backup $bak: $!\n";
+    }
+
+    return 1;
+}
+
+###----------------------------------------------------------------###
 
 sub parse_db {
     my ($self, $buffer, $pass) = @_;
@@ -86,7 +125,10 @@ sub parse_db {
     $self->parse_entries($buffer, $head->{'n_entries'}, $pos, $gmap, $groups);
 
     $self->{'header'} = $head;
+
+    $self->unlock if $self->{'groups'}; # make sure we don't leave dangling keys should we reopen a new db
     $self->{'groups'} = $groups;
+    $self->lock if $self->auto_lock;
     return 1;
 }
 
@@ -242,6 +284,8 @@ sub parse_date {
     return sprintf "%04d-%02d-%02d %02d:%02d:%02d", $year, $mon, $day, $hour, $min, $sec;
 }
 
+###----------------------------------------------------------------###
+
 sub gen_date {
     my ($self, $date) = @_;
     return "\0\0\0\0\0" if ! $date;
@@ -255,15 +299,15 @@ sub gen_date {
                );
 }
 
-###----------------------------------------------------------------###
-
 sub gen_db {
     my $self = shift;
     my $pass = shift;
     croak "Missing pass\n" if ! defined($pass);
     my $groups = shift || $self->groups;
+    croak "Please unlock before calling gen_db" if $self->is_locked($groups);
     my $head   = shift || {};
 
+    srand((time() ^ $$) * rand()) if ! $self->{'srand'};
     foreach my $key (qw(seed_rand enc_iv)) {
         next if defined $head->{$key};
         $head->{$key} = '';
@@ -440,13 +484,13 @@ sub add_entry {
 
 sub flat_entries {
     my $self = shift;
-    return (map { @{ $_->{'entries'} || [] } } $self->flat_groups);
+    return (map { @{ $_->{'entries'} || [] } } $self->flat_groups(@_));
 }
 
 sub active_entries {
     my $self = shift;
     my $now  = $self->now;
-    return (grep {!$_->{'expires'} || $_->{'expires'} ge $now} $self->flat_entries);
+    return (grep {!$_->{'expires'} || $_->{'expires'} ge $now} $self->flat_entries(@_));
 }
 
 sub now {
@@ -455,9 +499,9 @@ sub now {
 }
 
 sub find_entries {
-    my ($self, $args) = @_;
+    my ($self, $args, $groups) = @_;
     my @entries;
-    foreach my $g ($self->flat_groups) {
+    foreach my $g ($self->flat_groups($groups)) {
         foreach my $e (@{ $g->{'entries'} || [] }) {
             next if defined $args->{'group_id'} && (!defined($g->{'id'})       ||  $g->{'id'}       ne $args->{'group_id'});
             next if defined $args->{'title'}    && (!defined($e->{'title'})    ||  $e->{'title'}    ne $args->{'title'});
@@ -468,6 +512,56 @@ sub find_entries {
         }
     }
     return @entries;
+}
+
+sub find_entry {
+    my $self = shift;
+    my @e = $self->find_entries(@_);
+    croak "Found too many entries (@e)" if @e > 1;
+    return $e[0];
+}
+
+###----------------------------------------------------------------###
+
+sub is_locked {
+    my $self = shift;
+    my $groups = shift || $self->groups;
+    return $locker{"$groups"} ? 1 : 0;
+}
+
+sub lock {
+    my $self = shift;
+    my $groups = shift || $self->groups;
+    return 2 if $locker{"$groups"}; # not quite as fast as Scalar::Util::refaddr
+    my $ref = $locker{"$groups"} = {};
+    foreach my $e ($self->flat_entries($groups)) {
+        $ref->{"$e"} = delete $e->{'password'};
+    }
+    return 1;
+}
+
+sub unlock {
+    my $self = shift;
+    my $groups = shift || $self->groups;
+    return 2 if !$locker{"$groups"}; # not quite as fast as Scalar::Util::refaddr
+    my $ref = $locker{"$groups"};
+    foreach my $e ($self->flat_entries($groups)) {
+        $e->{'password'} = $ref->{"$e"};
+        $e->{'password'} = '' if ! defined $e->{'password'};
+    }
+    delete $locker{"$groups"};
+    return 1;
+}
+
+sub locked_entry_password {
+    my $self = shift;
+    my $entry = shift;
+    my $groups = shift || $self->groups;
+    my $ref = $locker{"$groups"} || croak "Passwords aren't locked";
+    $entry = $self->find_entry({uuid => $entry}, $groups) if ! ref $entry;
+    return if ! $entry;
+    my $pass = $ref->{"$entry"};
+    return $pass;
 }
 
 ###----------------------------------------------------------------###
