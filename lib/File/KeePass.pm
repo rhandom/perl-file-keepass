@@ -159,7 +159,7 @@ sub parse_entries {
 
         my $size = unpack 'L', substr($buffer, $pos, 4);
         $pos += 4;
-        die "Entry header offset is out of range. ($pos, ".length($buffer).", $size)" if $pos + $size > length($buffer);
+        die "Entry header offset is out of range for type $type. ($pos, ".length($buffer).", $size)" if $pos + $size > length($buffer);
 
         if ($type == 1) {
             $entry->{'uuid'}      = unpack 'H*', substr($buffer, $pos, $size);
@@ -194,8 +194,11 @@ sub parse_entries {
             my $gid = delete $entry->{'group_id'};
             my $ref = $gmap->{$gid};
             if (!$ref) { # orphaned nodes go in special group
-                $ref = $gmap->{0} = {id => 0, title => '*Orphaned*', icon => 0};
-                push @$groups, $ref;
+                $gid = -1;
+                if (!$gmap->{$gid}) {
+                    push @$groups, ($gmap->{$gid} = {id => $gid, title => '*Orphaned*', icon => 0});
+                }
+                $ref = $gmap->{$gid};
             }
 
             if ($entry->{'comment'} && $entry->{'comment'} eq 'KPX_GROUP_TREE_STATE') {
@@ -275,7 +278,8 @@ sub gen_db {
     $key = sha256($key);
     $key = sha256($head->{'seed_rand'}, $key);
 
-    my $buffer = '';
+    my $buffer  = '';
+    my $entries = '';
     foreach my $g ($self->flat_groups($groups)) {
         $head->{'n_groups'}++;
         my @d = ([1,      pack('LL', 4, $g->{'id'} || 0)],
@@ -287,7 +291,8 @@ sub gen_db {
         $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         foreach my $e (@{ $g->{'entries'} || [] }) {
             $head->{'n_entries'}++;
-            my @d = ([1,      pack('LH*', length($e->{'uuid'})/2, $e->{'uuid'})],
+            my @d = (
+                     [1,      pack('LH*', length($e->{'uuid'})/2, $e->{'uuid'})],
                      [2,      pack('LL', 4, $g->{'id'}   || 0)],
                      [3,      pack('LL', 4, $e->{'icon'} || 0)],
                      [4,      pack('L', length($e->{'title'})+1)."$e->{'title'}\0"],
@@ -295,17 +300,18 @@ sub gen_db {
                      [6,      pack('L', length($e->{'username'})+1). "$e->{'username'}\0"],
                      [7,      pack('L', length($e->{'password'})+1). "$e->{'password'}\0"],
                      [8,      pack('L', length($e->{'comment'})+1).  "$e->{'comment'}\0"],
-                     [9,      pack('L', 5, $self->gen_date($e->{'created'}))],
-                     [0xA,    pack('L', 5, $self->gen_date($e->{'modified'}))],
-                     [0xB,    pack('L', 5, $self->gen_date($e->{'accessed'}))],
-                     [0xC,    pack('L', 5, $self->gen_date($e->{'expires'}))],
+                     [9,      pack('L', 5). $self->gen_date($e->{'created'})],
+                     [0xA,    pack('L', 5). $self->gen_date($e->{'modified'})],
+                     [0xB,    pack('L', 5). $self->gen_date($e->{'accessed'})],
+                     [0xC,    pack('L', 5). $self->gen_date($e->{'expires'})],
                      [0xD,    pack('L', length($e->{'bin_desc'})+1)."$e->{'bin_desc'}\0"],
                      [0xE,    pack('L', length($e->{'binary'})).$e->{'binary'}],
                      [0xFFFF, pack('L', 0)]);
             push @d, [$_, $e->{'unknown'}->{$_}] for keys %{ $e->{'unknown'} || {} };
-            $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
+            $entries .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         }
     }
+    $buffer .= $entries; $entries = '';
 
     $head->{'checksum'} = sha256($buffer);
     $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
@@ -421,8 +427,10 @@ sub add_entry {
         $group = $self->find_group({id => $group}) || croak "Couldn't find a matching group to add entry to";
     }
 
-    $args->{$_} = '' for grep {!defined $args->{$_}} qw(title url username password comment bin_desc binary);
-    $args->{$_} = 0  for grep {!defined $args->{$_}} qw(id icon);
+    $args->{$_} = ''         for grep {!defined $args->{$_}} qw(title url username password comment bin_desc binary);
+    $args->{$_} = 0          for grep {!defined $args->{$_}} qw(id icon);
+    $args->{$_} = $self->now for grep {!defined $args->{$_}} qw(created accessed modified);;
+    $args->{'expires'} ||= '2999-12-31 23:23:59';
     $args->{'uuid'} = unpack 'H32', sha256(time.rand().$$) while !$args->{'uuid'} || $self->find_entries({uuid => $args->{'uuid'}});
 
     push @{ $group->{'entries'} ||= [] }, $args;
@@ -436,9 +444,13 @@ sub flat_entries {
 
 sub active_entries {
     my $self = shift;
-    my ($sec, $min, $hour, $day, $mon, $year) = localtime;
-    my $now = sprintf '%04d-%02d-%02d %02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
+    my $now  = $self->now;
     return (grep {!$_->{'expires'} || $_->{'expires'} ge $now} $self->flat_entries);
+}
+
+sub now {
+    my ($sec, $min, $hour, $day, $mon, $year) = localtime;
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
 }
 
 sub find_entries {
