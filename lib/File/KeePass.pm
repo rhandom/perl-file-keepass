@@ -107,31 +107,24 @@ sub parse_db {
     my $enc_type = ($head->{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
                  : ($head->{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
                  : die "Unknown encryption type\n";
+    $buffer = substr($buffer, DB_HEADER_SIZE);
 
     # use the headers to generate our encryption key in conjunction with the password
     my $key = sha256($pass);
     my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
-    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
+    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'}; # i suppose this introduces cryptographic overhead
     $key = sha256($key);
     $key = sha256($head->{'seed_rand'}, $key);
 
     # decrypt the buffer
-    my $crypto_size;
-    my $orig_buffer;
     if ($enc_type eq 'rijndael') {
-        my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
-        $cipher->set_iv($head->{'enc_iv'});
-        my $orig_size = length($buffer);
-        $buffer = $cipher->decrypt(substr($buffer,DB_HEADER_SIZE));
-        $orig_buffer = $buffer;
-        my $extra = ord(substr $buffer, -1, 1);
-        $crypto_size = $orig_size - DB_HEADER_SIZE - $extra;
-        substr($buffer, $crypto_size, $orig_size-$crypto_size, ''); #$buffer = substr($buffer, 0, $crypto_size);
+        $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
     } else {
         die "Unimplemented enc_type $enc_type";
     }
+
     croak "Decryption failed.\nThe key is wrong or the file is damaged.\n"
-        if $crypto_size > 2**31 || (!$crypto_size && $head->{'n_groups'});
+        if length($buffer) > 2**31 || (!length($buffer) && $head->{'n_groups'});
     croak "Checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)\n"
         if $head->{'checksum'} ne sha256($buffer);
 
@@ -301,6 +294,27 @@ sub parse_date {
 
 ###----------------------------------------------------------------###
 
+sub decrypt_rijndael_cbc {
+    my ($self, $buffer, $key, $enc_iv) = @_;
+    my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
+    $cipher->set_iv($enc_iv);
+    $buffer = $cipher->decrypt($buffer);
+    my $extra = ord(substr $buffer, -1, 1);
+    substr($buffer, length($buffer) - $extra, $extra, '');
+    return $buffer;
+}
+
+sub encrypt_rijndael_cbc {
+    my ($self, $buffer, $key, $enc_iv) = @_;
+    my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
+    $cipher->set_iv($enc_iv);
+    my $extra = (16 - length($buffer) % 16) || 16; # always pad so we can always trim
+    $buffer .= chr($extra) for 1 .. $extra;
+    return $cipher->encrypt($buffer);
+}
+
+###----------------------------------------------------------------###
+
 sub gen_date {
     my ($self, $date) = @_;
     return "\0\0\0\0\0" if ! $date;
@@ -374,19 +388,12 @@ sub gen_db {
     $buffer .= $entries; $entries = '';
 
     $head->{'checksum'} = sha256($buffer);
-    $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
-    $cipher->set_iv($head->{'enc_iv'});
-    my $extra = (16 - length($buffer) % 16) || 16; # always pad so we can always trim
-    $buffer .= chr($extra) for 1 .. $extra;
+    $head->{'sig1'}  = DB_SIG_1();
+    $head->{'sig2'}  = DB_SIG_2();
+    $head->{'flags'} = DB_FLAG_RIJNDAEL();
+    $head->{'ver'}   = DB_VER_DW();
 
-    local $head->{'sig1'}  = DB_SIG_1();
-    local $head->{'sig2'}  = DB_SIG_2();
-    local $head->{'flags'} = DB_FLAG_RIJNDAEL();
-    local $head->{'ver'}   = DB_VER_DW();
-    my $header = $self->gen_header($head);
-    my $enc    = $cipher->encrypt($buffer);
-
-    return $header.$enc;
+    return $self->gen_header($head) . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 }
 
 sub gen_header {
