@@ -390,10 +390,10 @@ sub gen_db {
                      [6,      pack('L', length($e->{'username'})+1). "$e->{'username'}\0"],
                      [7,      pack('L', length($e->{'password'})+1). "$e->{'password'}\0"],
                      [8,      pack('L', length($e->{'comment'})+1).  "$e->{'comment'}\0"],
-                     [9,      pack('L', 5). $self->gen_date($e->{'created'})],
-                     [0xA,    pack('L', 5). $self->gen_date($e->{'modified'})],
-                     [0xB,    pack('L', 5). $self->gen_date($e->{'accessed'})],
-                     [0xC,    pack('L', 5). $self->gen_date($e->{'expires'})],
+                     [9,      pack('L', 5). $self->gen_date($e->{'created'}  || $self->now)],
+                     [0xA,    pack('L', 5). $self->gen_date($e->{'modified'} || $self->now)],
+                     [0xB,    pack('L', 5). $self->gen_date($e->{'accessed'} || $self->now)],
+                     [0xC,    pack('L', 5). $self->gen_date($e->{'expires'}  || $self->now)],
                      [0xD,    pack('L', length($e->{'bin_desc'})+1)."$e->{'bin_desc'}\0"],
                      [0xE,    pack('L', length($e->{'binary'})).$e->{'binary'}],
                      [0xFFFF, pack('L', 0)]);
@@ -595,6 +595,7 @@ sub locked_entry_password {
     my $pass = $ref->{"$entry"};
     $pass = eval { $self->decrypt_rijndael_cbc($pass, $ref->{'_key'}, $ref->{'_enc_iv'}) } if $pass;
     $pass = '' if ! defined $pass;
+    $entry->{'accessed'} = $self->now;
     return $pass;
 }
 
@@ -682,6 +683,9 @@ Takes a kdb filename and a master password.  Stores out the current groups in th
 Writes attempt to write first to $file.new.$epoch and are then renamed into the correct
 location.
 
+You will need to unlock the db via $k->unlock before calling this method if the database
+is currently locked.
+
 =item clear
 
 Clears any currently loaded groups database.
@@ -722,6 +726,9 @@ If groups are not passed, it defaults to using the currently loaded groups.  If 
 not passed, a fresh set of headers are generated based on the groups and the master password.
 The headers can be passed in to test round trip portability.
 
+You will need to unlock the db via $k->unlock before calling this method if the database
+is currently locked.
+
 =item gen_header
 
 Returns a kdb file header.
@@ -732,21 +739,138 @@ Returns a kdb packed date.
 
 =item dump_groups
 
-Prints
+Returns a simplified string representation of the currently loaded database.
+
+    print $k->dump_groups;
 
 =item groups
+
+Returns an arrayref of groups from the currently loaded database.  Groups returned
+will be hierarchal.
+
+    my $g = $k->groups;
+
+Groups will look similar to the following:
+
+    $g = [{
+         expanded => 0,
+         icon     => 0,
+         id       => 234234234,
+         title    => 'Foo',
+         level    => 0,
+         entries => [{
+             accessed => "2010-06-24 15:09:19",
+             bin_desc => "",
+             binary   => "",
+             comment  => "",
+             created  => "2010-06-24 15:09:19",
+             expires  => "2999-12-31 23:23:59",
+             icon     => 0,
+             modified => "2010-06-24 15:09:19",
+             title    => "Something",
+             password => 'somepass', # will be hidden if the database is locked
+             url      => "",
+             username => "someuser",
+             uuid     => "0a55ac30af68149f62c072d7cc8bd5ee"
+         }],
+         groups => [{
+             expanded => 0,
+             icon     => 0,
+             id       => 994414667,
+             level    => 1,
+             title    => "Bar"
+         }],
+     }];
+
 =item header
+
+Returns the current loaded db header.
+
 =item add_group
+
+Adds a new group to the database.  If a database isn't loaded, it
+begins a new one.  Takes a hashref of arguments for the new entry
+including title, icon, expanded.  A new random group id will be
+generated.  An optional group argument can be passed.  If a group is
+passed the new group will be added under that parent group.
+
+    my $gid = $k->add_group({title => 'Foo'});
+
+    my $gid2 = $k->add_group({title => 'Bar', group => $gid});
+
 =item find_groups
+
+Takes a hashref of search criteria and returns all matching groups.  Can be passed id,
+title, icon, and level.
+
+    my @groups = $k->find_groups({title => 'Foo'});
+
+    my @all_groups_flattened = $k->find_groups({});
+
 =item find_group
+
+Calls find_groups and returns the first group found.  Dies if multiple results are found.
+
 =item add_entry
+
+Adds a new entry to the database.  An optional group argument can be
+passed.  If a group is not passed, the entry will be added to the
+first group in the database.  A new uuid will be created if one is not
+passed or if it conflicts with an existing group.
+
+The following fields can be passed.
+
+    accessed => "2010-06-24 15:09:19", # last accessed date
+    bin_desc => "", # description of the stored binary - typically a filename
+    binary   => "", # raw data to be stored in the system - typically a file
+    comment  => "", # a comment for the system - auto-type info is normally here
+    created  => "2010-06-24 15:09:19", # entry creation date
+    expires  => "2999-12-31 23:23:59", # date entry expires
+    icon     => 0, # icon number for use with agents
+    modified => "2010-06-24 15:09:19", # last modified
+    title    => "Something",
+    password => 'somepass', # will be hidden if the database is locked
+    url      => "",
+    username => "someuser",
+    uuid     => "0a55ac30af68149f62c072d7cc8bd5ee" # randomly generated automatically
+
 =item find_entries
+
+Takes a hashref of search criteria and returns all matching groups.  Can be passed uuid,
+title, username, comment, url, active, and group_id.
+
+    my @entries = $k->find_entries({title => 'Something'});
+
+    my @all_entries_flattened = $k->find_entries({});
+
 =item find_entry
+
+Calls find_entries and returns the first entry found.  Dies if multiple results are found.
+
 =item now
+
+Returns the current localtime datetime stamp.
+
 =item is_locked
+
+Returns true if the current database is locked.
+
 =item lock
+
+Locks the database.  This moves all passwords into a protected, in memory, encrypted
+storage location.  Returns 1 on success.  Returns 2 if the db is already locked.  If
+a database is loaded vai parse_db or load_db and auto_lock is true, the newly loaded
+database will start out locked.
+
 =item unlock
+
+Unlocks a previously locked database.  You will need to unlock a database before
+calling save_db or gen_db.
+
 =item locked_entry_password
+
+Allows access to individual passwords for a database that is locked.  Dies if the database
+is not locked.
 
 =back
 
@@ -756,12 +880,20 @@ Only Rijndael is supported.
 
 Only passkeys are supported (no key files).
 
+This module makes no attempt to act as a password agent.  That is the job of File::KeePass::Agent.
+This isn't really a bug but some people will think it is.
+
+Groups and entries don't have true objects associated with them.  At the moment this is by design.
+The data is kept as plain boring data.
+
 =head1 SOURCES
 
 Knowledge about the KeePass DB v1 format was gleaned from the source code of keepassx-0.4.3.  That
 source code is published under the GPL2 license.  KeePassX 0.4.3 bears the copyright of
+
     Copyright (C) 2005-2008 Tarek Saidi <tarek.saidi@arcor.de>
     Copyright (C) 2007-2009 Felix Geyer <debfx-keepassx {at} fobos.de>
+
 The encryption/decryption algorithms of File::KeePass are of derivative nature from KeePassX and could
 not have been created without this insight - though the perl code is from scratch.
 
