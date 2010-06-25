@@ -363,7 +363,8 @@ sub gen_db {
                 username => 'SYSTEM',
                 url      => '$',
                 uuid     => '00000000000000000000000000000000',
-            }, $g[0]);
+                group    => $g[0],
+            });
             $self->find_entry({uuid => $uuid});
         };
         $e->{'bin_desc'} = 'bin-stream';
@@ -451,18 +452,16 @@ sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
 sub header { shift->{'header'} || croak "No header loaded yet\n" }
 
 sub add_group {
-    my ($self, $args, $parent_group, $top_groups) = @_;
+    my ($self, $args, $top_groups) = @_;
     $args = {%$args};
     my $groups;
-    $parent_group ||= delete $args->{'group'};
+    my $parent_group = delete $args->{'group'};
     if (defined $parent_group) {
         $parent_group = $self->find_group({id => $parent_group}, $top_groups) if ! ref($parent_group);
         $groups = $parent_group->{'groups'} ||= [] if $parent_group;
     }
     $groups ||= $top_groups || ($self->{'groups'} ||= []);
 
-    $args->{'title'} = '' if ! defined $args->{'title'};
-    $args->{'icon'} ||= 0;
     push @$groups, $args;
     $self->find_groups({}, $groups); # sets level and gid
     return $args->{'id'};
@@ -471,9 +470,15 @@ sub add_group {
 sub find_groups {
     my ($self, $args, $groups, $level) = @_;
     my @groups;
+    my %used;
     for my $g (@{ $groups || $self->groups}) {
         $g->{'level'} = $level || 0;
-        $g->{'id'} = int((2**32-1) * rand()) if ! defined $g->{'id'};
+        $g->{'title'} = '' if ! defined $g->{'title'};
+        $g->{'icon'}  ||= 0;
+        while (!defined($g->{'id'}) || $used{$g->{'id'}}++) {
+            warn "Found duplicate group_id - generating new one for \"$g->{'title'}\"" if defined($g->{'id'});
+            $g->{'id'} = int((2**32-1) * rand());
+        }
         if (   (!defined $args->{'id'}    || $g->{'id'}    eq $args->{'id'})
             && (!defined $args->{'title'} || $g->{'title'} eq $args->{'title'})
             && (!defined $args->{'icon'}  || $g->{'icon'}  eq $args->{'icon'})) {
@@ -494,11 +499,11 @@ sub find_group {
 ###----------------------------------------------------------------###
 
 sub add_entry {
-    my ($self, $args, $group, $groups) = @_;
+    my ($self, $args, $groups) = @_;
     $groups ||= $self->groups;
     croak "You must unlock the passwords before adding new entries.\n" if $self->is_locked($groups);
     $args = {%$args};
-    $group ||= delete($args->{'group'}) || $groups->[0] || $self->add_group({});
+    my $group = delete($args->{'group'}) || $groups->[0] || $self->add_group({});
     if (! ref($group)) {
         $group = $self->find_group({id => $group}, $groups) || croak "Couldn't find a matching group to add entry to";
     }
@@ -627,20 +632,24 @@ __END__
         title => 'Foo',
     }); # root level group
 
-    my $gid2 = $k->add_group({
-        title => 'Bar',
-        group => $gid,
-    }); # nested group
-
     my $group = $k->find_group({id => $gid});
     # OR
     my $group = $k->find_group({title => 'Foo'});
+
+
+    my $gid2 = $k->add_group({
+        title => 'Bar',
+        group => $gid,
+        # OR group => $group,
+    }); # nested group
+
 
     my $uuid = $k->add_entry({
         title    => 'Something',
         username => 'someuser',
         password => 'somepass',
         group    => $gid,
+        # OR group => $group,
     });
 
     my $e = $k->find_entry({uuid => $uuid});
@@ -798,6 +807,9 @@ passed the new group will be added under that parent group.
 
     my $gid2 = $k->add_group({title => 'Bar', group => $gid});
 
+The group argument's value may also be a reference to a group - such as
+that returned by find_group.
+
 =item find_groups
 
 Takes a hashref of search criteria and returns all matching groups.  Can be passed id,
@@ -833,6 +845,11 @@ The following fields can be passed.
     url      => "",
     username => "someuser",
     uuid     => "0a55ac30af68149f62c072d7cc8bd5ee" # randomly generated automatically
+
+    group    => $gid, # which group to add the entry to
+
+The group argument's value may also be a reference to a group - such as
+that returned by find_group.
 
 =item find_entries
 
