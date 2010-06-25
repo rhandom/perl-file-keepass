@@ -213,7 +213,7 @@ sub parse_entries {
         die "Entry header offset is out of range for type $type. ($pos, ".length($buffer).", $size)" if $pos + $size > length($buffer);
 
         if ($type == 1) {
-            $entry->{'uuid'}      = unpack 'H*', substr($buffer, $pos, $size);
+            $entry->{'id'}        = unpack 'H*', substr($buffer, $pos, $size);
         } elsif ($type == 2) {
             $entry->{'group_id'}  = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 3) {
@@ -361,7 +361,7 @@ sub gen_db {
             title    => 'Meta-Info',
             username => 'SYSTEM',
             url      => '$',
-            uuid     => '00000000000000000000000000000000',
+            id     => '00000000000000000000000000000000',
             group    => $g[0],
         });
         $e->{'bin_desc'} = 'bin-stream';
@@ -380,7 +380,7 @@ sub gen_db {
         foreach my $e (@{ $g->{'entries'} || [] }) {
             $head->{'n_entries'}++;
             my @d = (
-                     [1,      pack('LH*', length($e->{'uuid'})/2, $e->{'uuid'})],
+                     [1,      pack('LH*', length($e->{'id'})/2, $e->{'id'})],
                      [2,      pack('LL', 4, $g->{'id'}   || 0)],
                      [3,      pack('LL', 4, $e->{'icon'} || 0)],
                      [4,      pack('L', length($e->{'title'})+1)."$e->{'title'}\0"],
@@ -439,7 +439,7 @@ sub dump_groups {
     $t .= $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'})\n";
     $t .= $self->dump_groups($_, "$indent    ") for grep {$_} @{ $g->{'groups'} || [] };
     for my $e (@{ $g->{'entries'} || [] }) {
-        $t .= "$indent    > $e->{'title'}\t($e->{'uuid'})\n";
+        $t .= "$indent    > $e->{'title'}\t($e->{'id'})\n";
     }
     return $t;
 }
@@ -509,7 +509,9 @@ sub add_entry {
     $args->{$_} = 0          for grep {!defined $args->{$_}} qw(id icon);
     $args->{$_} = $self->now for grep {!defined $args->{$_}} qw(created accessed modified);;
     $args->{'expires'} ||= '2999-12-31 23:23:59';
-    $args->{'uuid'} = unpack 'H32', sha256(time.rand().$$) while !$args->{'uuid'} || $self->find_entries({uuid => $args->{'uuid'}}, $groups);
+    while (!$args->{'id'} || $args->{'id'} !~ /^[a-f0-9]{32}$/ || $self->find_entries({id => $args->{'id'}}, $groups)) {
+        $args->{'id'} = unpack 'H32', sha256(time.rand().$$);
+    }
 
     push @{ $group->{'entries'} ||= [] }, $args;
     return $args;
@@ -524,7 +526,7 @@ sub find_entries {
             next if defined $args->{'title'}    && (!defined($e->{'title'})    ||  $e->{'title'}    ne $args->{'title'});
             next if defined $args->{'username'} && (!defined($e->{'username'}) ||  $e->{'username'} ne $args->{'username'});
             next if defined $args->{'url'}      && (!defined($e->{'url'})      ||  $e->{'url'}      ne $args->{'url'});
-            next if defined $args->{'uuid'}     && (!defined($e->{'uuid'})     ||  $e->{'uuid'}     ne $args->{'uuid'});
+            next if defined $args->{'id'}       && (!defined($e->{'id'})       ||  $e->{'id'}       ne $args->{'id'});
             next if defined $args->{'comment'}  && (!defined($e->{'comment'})  ||  $e->{'comment'}  ne $args->{'comment'});
             next if $args->{'active'} && (!$e->{'expires'} || $e->{'expires'} le $self->now);
             push @entries, $e;
@@ -592,7 +594,7 @@ sub locked_entry_password {
     my $entry = shift;
     my $groups = shift || $self->groups;
     my $ref = $locker{"$groups"} || croak "Passwords aren't locked";
-    $entry = $self->find_entry({uuid => $entry}, $groups) if ! ref $entry;
+    $entry = $self->find_entry({id => $entry}, $groups) if ! ref $entry;
     return if ! $entry;
     my $pass = $ref->{"$entry"};
     $pass = eval { $self->decrypt_rijndael_cbc($pass, $ref->{'_key'}, $ref->{'_enc_iv'}) } if $pass;
@@ -649,9 +651,9 @@ __END__
         group    => $gid,
         # OR group => $group,
     });
-    my $uuid = $e->{'uuid'};
+    my $eid = $e->{'id'};
 
-    my $e = $k->find_entry({uuid => $uuid});
+    my $e = $k->find_entry({id => $eid});
     # OR
     my $e = $k->find_entry({title => 'Something'});
 
@@ -780,7 +782,7 @@ Groups will look similar to the following:
              password => 'somepass', # will be hidden if the database is locked
              url      => "",
              username => "someuser",
-             uuid     => "0a55ac30af68149f62c072d7cc8bd5ee"
+             id       => "0a55ac30af68149f62c072d7cc8bd5ee"
          }],
          groups => [{
              expanded => 0,
@@ -833,7 +835,7 @@ Calls find_groups and returns the first group found.  Dies if multiple results a
 Adds a new entry to the database.  Returns a reference to the new
 entry.  An optional group argument can be passed.  If a group is not
 passed, the entry will be added to the first group in the database.  A
-new uuid will be created if one is not passed or if it conflicts with
+new id will be created if one is not passed or if it conflicts with
 an existing group.
 
 The following fields can be passed.
@@ -850,7 +852,7 @@ The following fields can be passed.
     password => 'somepass', # will be hidden if the database is locked
     url      => "",
     username => "someuser",
-    uuid     => "0a55ac30af68149f62c072d7cc8bd5ee" # randomly generated automatically
+    id       => "0a55ac30af68149f62c072d7cc8bd5ee" # randomly generated automatically
 
     group    => $gid, # which group to add the entry to
 
@@ -859,7 +861,7 @@ that returned by find_group.
 
 =item find_entries
 
-Takes a hashref of search criteria and returns all matching groups.  Can be passed uuid,
+Takes a hashref of search criteria and returns all matching groups.  Can be passed id,
 title, username, comment, url, active, and group_id.
 
     my @entries = $k->find_entries({title => 'Something'});

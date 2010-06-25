@@ -44,14 +44,14 @@ is($g2->{'title'}, 'Bar', "Was the same group");
 # try adding an entry
 my $e  = $obj->add_entry({title => 'bam', password => 'flimflam'});
 ok($e, "Added an entry");
-my $e_uuid = $e->{'uuid'};
-ok($e_uuid, "Added an entry");
+my $eid = $e->{'id'};
+ok($eid, "Added an entry");
 my $e2 = $obj->add_entry({title => 'bim', username => 'BIM'});
-my $e_uuid2 = $e2->{'uuid'};
+my $eid2 = $e2->{'id'};
 
 my @e = $obj->find_entries({title => 'bam'});
 is(scalar(@e), 1, "Found one entry");
-is($e[0]->{'uuid'}, $e_uuid, "Is the right one");
+is($e[0]->{'id'}, $eid, "Is the right one");
 
 ok(!eval { $obj->locked_entry_password($e[0]) }, 'Can unlock unlocked password');
 
@@ -77,7 +77,7 @@ is($g->{'title'}, 'Foo', "Was the correct group");
 
 $e = eval { $obj->find_entry({title => 'bam'}) };
 ok($e, "Found one entry");
-is($e->{'uuid'}, $e_uuid, "Is the right one");
+is($e->{'id'}, $eid, "Is the right one");
 
 
 ###----------------------------------------------------------------###
