@@ -356,17 +356,14 @@ sub gen_db {
     my $entries = '';
     my @g = $self->find_groups({}, $groups);
     if (grep {$_->{'expanded'}} @g) {
-        my $e = ($self->find_entries({title => 'Meta-Info', username => 'SYSTEM', comment => 'KPX_GROUP_TREE_STATE', url => '$'}))[0] || do {
-            my $uuid = $self->add_entry({
-                comment  => 'KPX_GROUP_TREE_STATE',
-                title    => 'Meta-Info',
-                username => 'SYSTEM',
-                url      => '$',
-                uuid     => '00000000000000000000000000000000',
-                group    => $g[0],
-            });
-            $self->find_entry({uuid => $uuid});
-        };
+        my $e = ($self->find_entries({title => 'Meta-Info', username => 'SYSTEM', comment => 'KPX_GROUP_TREE_STATE', url => '$'}))[0] || $self->add_entry({
+            comment  => 'KPX_GROUP_TREE_STATE',
+            title    => 'Meta-Info',
+            username => 'SYSTEM',
+            url      => '$',
+            uuid     => '00000000000000000000000000000000',
+            group    => $g[0],
+        });
         $e->{'bin_desc'} = 'bin-stream';
         $e->{'binary'} = pack 'L', scalar(@g);
         $e->{'binary'} .= pack('LC', $_->{'id'}, $_->{'expanded'} ? 1 : 0) for @g;
@@ -463,8 +460,8 @@ sub add_group {
     $groups ||= $top_groups || ($self->{'groups'} ||= []);
 
     push @$groups, $args;
-    $self->find_groups({}, $groups); # sets level and gid
-    return $args->{'id'};
+    $self->find_groups({}, $groups); # sets title, level, icon and id
+    return $args;
 }
 
 sub find_groups {
@@ -515,7 +512,7 @@ sub add_entry {
     $args->{'uuid'} = unpack 'H32', sha256(time.rand().$$) while !$args->{'uuid'} || $self->find_entries({uuid => $args->{'uuid'}}, $groups);
 
     push @{ $group->{'entries'} ||= [] }, $args;
-    return $args->{'uuid'};
+    return $args;
 }
 
 sub find_entries {
@@ -628,29 +625,31 @@ __END__
     $k->clear; # delete current db from memory
 
 
-    my $gid = $k->add_group({
+    my $group = $k->add_group({
         title => 'Foo',
     }); # root level group
+    my $gid = $group->{'id'};
 
     my $group = $k->find_group({id => $gid});
     # OR
     my $group = $k->find_group({title => 'Foo'});
 
 
-    my $gid2 = $k->add_group({
+    my $group2 = $k->add_group({
         title => 'Bar',
         group => $gid,
         # OR group => $group,
     }); # nested group
 
 
-    my $uuid = $k->add_entry({
+    my $e = $k->add_entry({
         title    => 'Something',
         username => 'someuser',
         password => 'somepass',
         group    => $gid,
         # OR group => $group,
     });
+    my $uuid = $e->{'uuid'};
 
     my $e = $k->find_entry({uuid => $uuid});
     # OR
@@ -755,7 +754,8 @@ Returns a simplified string representation of the currently loaded database.
 =item groups
 
 Returns an arrayref of groups from the currently loaded database.  Groups returned
-will be hierarchal.
+will be hierarchal.  Note, groups simply returns a reference to all of the data.  It
+makes no attempts at cleaning up the data (find_groups will make sure the data is groomed).
 
     my $g = $k->groups;
 
@@ -797,15 +797,17 @@ Returns the current loaded db header.
 
 =item add_group
 
-Adds a new group to the database.  If a database isn't loaded, it
-begins a new one.  Takes a hashref of arguments for the new entry
-including title, icon, expanded.  A new random group id will be
-generated.  An optional group argument can be passed.  If a group is
-passed the new group will be added under that parent group.
+Adds a new group to the database.  Returns a reference to the new
+group.  If a database isn't loaded, it begins a new one.  Takes a
+hashref of arguments for the new entry including title, icon,
+expanded.  A new random group id will be generated.  An optional group
+argument can be passed.  If a group is passed the new group will be
+added under that parent group.
 
-    my $gid = $k->add_group({title => 'Foo'});
+    my $group = $k->add_group({title => 'Foo'});
+    my $gid = $group->{'id'};
 
-    my $gid2 = $k->add_group({title => 'Bar', group => $gid});
+    my $group2 = $k->add_group({title => 'Bar', group => $gid});
 
 The group argument's value may also be a reference to a group - such as
 that returned by find_group.
@@ -819,16 +821,20 @@ title, icon, and level.
 
     my @all_groups_flattened = $k->find_groups({});
 
+The find_groups method also checks to make sure group ids are unique and that all needed
+values are defined.
+
 =item find_group
 
 Calls find_groups and returns the first group found.  Dies if multiple results are found.
 
 =item add_entry
 
-Adds a new entry to the database.  An optional group argument can be
-passed.  If a group is not passed, the entry will be added to the
-first group in the database.  A new uuid will be created if one is not
-passed or if it conflicts with an existing group.
+Adds a new entry to the database.  Returns a reference to the new
+entry.  An optional group argument can be passed.  If a group is not
+passed, the entry will be added to the first group in the database.  A
+new uuid will be created if one is not passed or if it conflicts with
+an existing group.
 
 The following fields can be passed.
 
