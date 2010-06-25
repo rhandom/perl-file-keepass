@@ -429,12 +429,14 @@ sub gen_header {
 ###----------------------------------------------------------------###
 
 sub dump_groups {
-    my ($self, $groups) = @_;
+    my ($self, $args, $groups) = @_;
     my $t = '';
-    foreach my $g ($self->find_groups({}, $groups)) {
+    my %gargs; for (keys %$args) { $gargs{$2} = $args->{$1} if /^(group_(.+))$/ };
+    foreach my $g ($self->find_groups(\%gargs, $groups)) {
         my $indent = '    ' x $g->{'level'};
         $t .= $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'})\n";
-        $t .= "$indent    > $_->{'title'}\t($_->{'id'})\n" for @{ $g->{'entries'} || [] };
+        local $g->{'groups'}; # don't recurse while looking for entries since we are already flat
+        $t .= "$indent    > $_->{'title'}\t($_->{'id'})\n" for $self->find_entries($args, [$g]);
     }
     return $t;
 }
@@ -459,8 +461,26 @@ sub add_group {
     return $args;
 }
 
+sub finder_tests {
+    my ($self, $args) = @_;
+    my @tests;
+    foreach my $key (keys %{ $args || {} }) {
+        next if ! defined $args->{$key};
+        my ($field, $op) = ($key =~ m{ ^ (\w+) \s* (|!|=|!~|=~|gt|lt) $ }x) ? ($1, $2) : croak "Invalid find match criteria \"$key\"";
+        push @tests,  (!$op || $op eq '=') ? sub {  defined($_[0]->{$field}) && $_[0]->{$field} eq $args->{$key} }
+                    : ($op eq '!')         ? sub { !defined($_[0]->{$field}) || $_[0]->{$field} ne $args->{$key} }
+                    : ($op eq '=~')        ? sub {  defined($_[0]->{$field}) && $_[0]->{$field} =~ $args->{$key} }
+                    : ($op eq '!~')        ? sub { !defined($_[0]->{$field}) || $_[0]->{$field} !~ $args->{$key} }
+                    : ($op eq 'gt')        ? sub {  defined($_[0]->{$field}) && $_[0]->{$field} gt $args->{$key} }
+                    : ($op eq 'lt')        ? sub {  defined($_[0]->{$field}) && $_[0]->{$field} lt $args->{$key} }
+                    : croak;
+    }
+    return @tests;
+}
+
 sub find_groups {
     my ($self, $args, $groups, $level) = @_;
+    my @tests = $self->finder_tests($args);
     my @groups;
     my %used;
     for my $g (@{ $groups || $self->groups}) {
@@ -471,11 +491,7 @@ sub find_groups {
             warn "Found duplicate group_id - generating new one for \"$g->{'title'}\"" if defined($g->{'id'});
             $g->{'id'} = int((2**32-1) * rand());
         }
-        if (   (!defined $args->{'id'}    || $g->{'id'}    eq $args->{'id'})
-            && (!defined $args->{'title'} || $g->{'title'} eq $args->{'title'})
-            && (!defined $args->{'icon'}  || $g->{'icon'}  eq $args->{'icon'})) {
-            push @groups, $g;
-        }
+        push @groups, $g if !@tests || !grep{!$_->($g)} @tests;
         push @groups, $self->find_groups($args, $g->{'groups'}, $g->{'level'} + 1) if $g->{'groups'};
     }
     return @groups;
@@ -514,17 +530,14 @@ sub add_entry {
 
 sub find_entries {
     my ($self, $args, $groups) = @_;
+    local @{ $args }{'expires gt', 'active'} = ($self->now, undef) if $args->{'active'};
+    my @tests = $self->finder_tests($args);
     my @entries;
     foreach my $g ($self->find_groups({}, $groups)) {
         foreach my $e (@{ $g->{'entries'} || [] }) {
-            next if defined $args->{'group_id'} && (!defined($g->{'id'})       ||  $g->{'id'}       ne $args->{'group_id'});
-            next if defined $args->{'title'}    && (!defined($e->{'title'})    ||  $e->{'title'}    ne $args->{'title'});
-            next if defined $args->{'username'} && (!defined($e->{'username'}) ||  $e->{'username'} ne $args->{'username'});
-            next if defined $args->{'url'}      && (!defined($e->{'url'})      ||  $e->{'url'}      ne $args->{'url'});
-            next if defined $args->{'id'}       && (!defined($e->{'id'})       ||  $e->{'id'}       ne $args->{'id'});
-            next if defined $args->{'comment'}  && (!defined($e->{'comment'})  ||  $e->{'comment'}  ne $args->{'comment'});
-            next if $args->{'active'} && (!$e->{'expires'} || $e->{'expires'} le $self->now);
-            push @entries, $e;
+            local $e->{'group_id'}    = $g->{'id'};
+            local $e->{'group_title'} = $g->{'title'};
+            push @entries, $e if !@tests || !grep{!$_->($e)} @tests;
         }
     }
     return @entries;
@@ -748,6 +761,9 @@ Returns a simplified string representation of the currently loaded database.
 
     print $k->dump_groups;
 
+You can optionally pass a match argument hashref.  Only entries matching the
+criteria will be returned.
+
 =item groups
 
 Returns an arrayref of groups from the currently loaded database.  Groups returned
@@ -809,10 +825,20 @@ added under that parent group.
 The group argument's value may also be a reference to a group - such as
 that returned by find_group.
 
+=item finder_tests {
+
+Used by find_groups and find_entries.  Takes a hashref of arguments and returns a list
+of test code refs.
+
+    {title => 'Foo'} # will check if title equals Foo
+    {'title !' => 'Foo'} # will check if title does not equal Foo
+    {'title =~' => qr{^Foo$}} # will check if title does matches the regex
+    {'title !~' => qr{^Foo$}} # will check if title does not match the regex
+
 =item find_groups
 
 Takes a hashref of search criteria and returns all matching groups.  Can be passed id,
-title, icon, and level.
+title, icon, and level.  Search arguments will be parsed by finder_tests.
 
     my @groups = $k->find_groups({title => 'Foo'});
 
@@ -856,8 +882,10 @@ that returned by find_group.
 
 =item find_entries
 
-Takes a hashref of search criteria and returns all matching groups.  Can be passed an entry id,
-title, username, comment, url, active, and/or group_id.
+Takes a hashref of search criteria and returns all matching groups.
+Can be passed an entry id, title, username, comment, url, active,
+group_id, group_title, or any other entry property.  Search arguments
+will be parsed by finder_tests.
 
     my @entries = $k->find_entries({title => 'Something'});
 
