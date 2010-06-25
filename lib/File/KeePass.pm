@@ -429,17 +429,12 @@ sub gen_header {
 ###----------------------------------------------------------------###
 
 sub dump_groups {
-    my ($self, $g, $indent) = @_;
+    my ($self, $groups) = @_;
     my $t = '';
-    if (! $g) {
-        $t .= $self->dump_groups($_) for @{ $self->groups };
-        return $t;
-    }
-    $indent = '' if ! $indent;
-    $t .= $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'})\n";
-    $t .= $self->dump_groups($_, "$indent    ") for grep {$_} @{ $g->{'groups'} || [] };
-    for my $e (@{ $g->{'entries'} || [] }) {
-        $t .= "$indent    > $e->{'title'}\t($e->{'id'})\n";
+    foreach my $g ($self->find_groups({}, $groups)) {
+        my $indent = '    ' x $g->{'level'};
+        $t .= $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'})\n";
+        $t .= "$indent    > $_->{'title'}\t($_->{'id'})\n" for @{ $g->{'entries'} || [] };
     }
     return $t;
 }
@@ -509,7 +504,7 @@ sub add_entry {
     $args->{$_} = 0          for grep {!defined $args->{$_}} qw(id icon);
     $args->{$_} = $self->now for grep {!defined $args->{$_}} qw(created accessed modified);;
     $args->{'expires'} ||= '2999-12-31 23:23:59';
-    while (!$args->{'id'} || $args->{'id'} !~ /^[a-f0-9]{32}$/ || $self->find_entries({id => $args->{'id'}}, $groups)) {
+    while (!$args->{'id'} || $args->{'id'} !~ /^[a-f0-9]{32}$/ || $self->find_entry({id => $args->{'id'}}, $groups)) {
         $args->{'id'} = unpack 'H32', sha256(time.rand().$$);
     }
 
@@ -835,7 +830,7 @@ Calls find_groups and returns the first group found.  Dies if multiple results a
 Adds a new entry to the database.  Returns a reference to the new
 entry.  An optional group argument can be passed.  If a group is not
 passed, the entry will be added to the first group in the database.  A
-new id will be created if one is not passed or if it conflicts with
+new entry id will be created if one is not passed or if it conflicts with
 an existing group.
 
 The following fields can be passed.
@@ -861,8 +856,8 @@ that returned by find_group.
 
 =item find_entries
 
-Takes a hashref of search criteria and returns all matching groups.  Can be passed id,
-title, username, comment, url, active, and group_id.
+Takes a hashref of search criteria and returns all matching groups.  Can be passed an entry id,
+title, username, comment, url, active, and/or group_id.
 
     my @entries = $k->find_entries({title => 'Something'});
 
