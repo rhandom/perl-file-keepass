@@ -483,7 +483,8 @@ sub find_groups {
     my @tests = $self->finder_tests($args);
     my @groups;
     my %used;
-    for my $g (@{ $groups || $self->groups}) {
+    my $container = $groups || $self->groups;
+    for my $g (@$container) {
         $g->{'level'} = $level || 0;
         $g->{'title'} = '' if ! defined $g->{'title'};
         $g->{'icon'}  ||= 0;
@@ -491,7 +492,10 @@ sub find_groups {
             warn "Found duplicate group_id - generating new one for \"$g->{'title'}\"" if defined($g->{'id'});
             $g->{'id'} = int((2**32-1) * rand());
         }
-        push @groups, $g if !@tests || !grep{!$_->($g)} @tests;
+        if (!@tests || !grep{!$_->($g)} @tests) {
+            push @groups, $g;
+            push @{ $self->{'__group_groups'} }, $container if $self->{'__group_groups'};
+        }
         push @groups, $self->find_groups($args, $g->{'groups'}, $g->{'level'} + 1) if $g->{'groups'};
     }
     return @groups;
@@ -499,9 +503,10 @@ sub find_groups {
 
 sub find_group {
     my $self = shift;
+    local $self->{'__group_groups'} = [] if wantarray;
     my @g = $self->find_groups(@_);
     croak "Found too many groups (@g)" if @g > 1;
-    return $g[0];
+    return wantarray ? ($g[0], $self->{'__group_groups'}->[0]) : $g[0];
 }
 
 ###----------------------------------------------------------------###
@@ -537,7 +542,10 @@ sub find_entries {
         foreach my $e (@{ $g->{'entries'} || [] }) {
             local $e->{'group_id'}    = $g->{'id'};
             local $e->{'group_title'} = $g->{'title'};
-            push @entries, $e if !@tests || !grep{!$_->($e)} @tests;
+            if (!@tests || !grep{!$_->($e)} @tests) {
+                push @entries, $e;
+                push @{ $self->{'__entry_groups'} }, $g if $self->{'__entry_groups'};
+            }
         }
     }
     return @entries;
@@ -545,9 +553,10 @@ sub find_entries {
 
 sub find_entry {
     my $self = shift;
+    local $self->{'__entry_groups'} = [] if wantarray;
     my @e = $self->find_entries(@_);
     croak "Found too many entries (@e)" if @e > 1;
-    return $e[0];
+    return wantarray ? ($e[0], $self->{'__entry_groups'}->[0]) : $e[0];
 }
 
 sub now {
@@ -850,6 +859,8 @@ values are defined.
 =item find_group
 
 Calls find_groups and returns the first group found.  Dies if multiple results are found.
+In scalar context it returns only the group.  In list context it returns the group, and its
+the arrayref in which it is stored (either the root level group or a sub groups group item).
 
 =item add_entry
 
@@ -894,6 +905,8 @@ will be parsed by finder_tests.
 =item find_entry
 
 Calls find_entries and returns the first entry found.  Dies if multiple results are found.
+In scalar context it returns only the entry.  In list context it returns the entry, and its
+group.
 
 =item now
 
