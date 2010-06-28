@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 54;
+use Test::More tests => 62;
 
 use_ok('File::KeePass');
 
@@ -47,6 +47,10 @@ is($g2->{'title'}, 'Bar', "Groups - Was the same group");
 my $g2_2 = $obj->find_group({'id =' => $gid2});
 is($g2_2, $g2, "Search - eq searching works");
 
+($g2_2, my $gcontainer) = $obj->find_group({'id =' => $gid2});
+is($g2_2, $g2, "Search - find_group wantarray works");
+is($gcontainer, $g->{'groups'}, "Search - find_group wantarray works");
+
 $g2_2 = $obj->find_group({'id !' => $gid});
 is($g2_2, $g2, "Search - ne searching works");
 
@@ -65,11 +69,11 @@ is($g_2, $g, "Search - Greater than searching works");
 ###----------------------------------------------------------------###
 
 # try adding an entry
-my $e  = $obj->add_entry({title => 'bam', password => 'flimflam'});
+my $e  = $obj->add_entry({title => 'bam', password => 'flimflam'}); # defaults to first group
 ok($e, "Entry - Added an entry");
 my $eid = $e->{'id'};
 ok($eid, "Entry - Added an entry");
-my $e2 = $obj->add_entry({title => 'bim', username => 'BIM'});
+my $e2 = $obj->add_entry({title => 'bim', username => 'BIM', group => $g2});
 my $eid2 = $e2->{'id'};
 
 my @e = $obj->find_entries({title => 'bam'});
@@ -81,14 +85,27 @@ ok(!eval { $obj->locked_entry_password($e[0]) }, 'Entry - Can unlock unlocked pa
 @e = $obj->find_entries({active => 1});
 is(scalar(@e), 2, "Entry - Found right number of active entries");
 
+my $e_2 = $obj->find_entry({title => 'bam'});
+is($e_2, $e, "Entry - find_entry works");
+
+($e_2, my $e_group) = $obj->find_entry({title => 'bam'});
+is($e_2, $e, "Entry - find_entry works");
+is($e_group, $g, "Entry - find_entry works");
+
+my ($e2_2, $e2_group) = $obj->find_entry({title => 'bim'});
+is($e2_2, $e2, "Entry - find_entry works");
+is($e2_group, $g2, "Entry - find_entry works");
+
 ###----------------------------------------------------------------###
 
 # turn it into the binary encrypted blob
+ok(!eval { $obj->gen_db }, "Parsing - can't gen without a password");
 my $db = $obj->gen_db($pass);
 ok($db, "Parsing - Gened a db");
 
 # now try parsing it and make sure it is still in ok form
 $obj->auto_lock(0);
+
 my $ok = $obj->parse_db($db, $pass);
 ok($ok, "Parsing - Re-parsed groups");
 ok($obj->header, "Parsing - We now have a header");
