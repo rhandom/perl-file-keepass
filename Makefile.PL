@@ -11,6 +11,10 @@ WriteMakefile(
               ABSTRACT_FROM => "lib/File/KeePass.pm",
               VERSION_FROM  => "lib/File/KeePass.pm",
               INSTALLDIRS   => 'site',
+              PREREQ_PM     => {
+                  'Crypt::Rijndael' => '1.0',
+                  'Digest::SHA'     => '1.0',
+              },
               dist          => {
                 DIST_DEFAULT => 'all tardist',
                 COMPRESS     => 'gzip -vf',
