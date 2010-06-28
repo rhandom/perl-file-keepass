@@ -509,6 +509,18 @@ sub find_group {
     return wantarray ? ($g[0], $self->{'__group_groups'}->[0]) : $g[0];
 }
 
+sub delete_group {
+    my $self = shift;
+    my ($g, $c) = $self->find_group(@_);
+    return if !$g || !$c;
+    for my $i (0 .. $#$c) {
+        next if $c->[$i] ne $g;
+        splice(@$c, $i, 1, ());
+        last;
+    }
+    return $g;
+}
+
 ###----------------------------------------------------------------###
 
 sub add_entry {
@@ -557,6 +569,18 @@ sub find_entry {
     my @e = $self->find_entries(@_);
     croak "Found too many entries (@e)" if @e > 1;
     return wantarray ? ($e[0], $self->{'__entry_groups'}->[0]) : $e[0];
+}
+
+sub delete_entry {
+    my $self = shift;
+    my ($e, $g) = $self->find_entry(@_);
+    return if !$e || !$g;
+    for my $i (0 .. $#{ $g->{'entries'} || [] }) {
+        next if $g->{'entries'}->[$i] ne $e;
+        splice(@{ $g->{'entries'} }, $i, 1, ());
+        last;
+    }
+    return $e;
 }
 
 sub now {
@@ -862,6 +886,11 @@ Calls find_groups and returns the first group found.  Dies if multiple results a
 In scalar context it returns only the group.  In list context it returns the group, and its
 the arrayref in which it is stored (either the root level group or a sub groups group item).
 
+=item delete_group
+
+Passes arguments to find_group to find the group to delete.  Then deletes the group.  Returns
+the group that was just deleted.
+
 =item add_entry
 
 Adds a new entry to the database.  Returns a reference to the new
@@ -907,6 +936,11 @@ will be parsed by finder_tests.
 Calls find_entries and returns the first entry found.  Dies if multiple results are found.
 In scalar context it returns only the entry.  In list context it returns the entry, and its
 group.
+
+=item delete_entry
+
+Passes arguments to find_entry to find the entry to delete.  Then deletes the entry.  Returns
+the entry that was just deleted.
 
 =item now
 

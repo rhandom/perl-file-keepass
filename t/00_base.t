@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 62;
+use Test::More tests => 68;
 
 use_ok('File::KeePass');
 
@@ -176,3 +176,18 @@ unlink("$file.bak");
 my $dump = eval { $obj->dump_groups };
 diag($dump);
 ok($dump, "General - Ran dump groups");
+
+###----------------------------------------------------------------###
+
+ok(!eval { $obj->delete_entry({}) }, "Delete - fails on delete of too many entries");
+ok(scalar $obj->find_entry({title => 'bam'}), 'Delete - found entry');
+$obj->delete_entry({title => 'bam'});
+ok(!$obj->find_entry({title => 'bam'}), 'Delete - delete_entry worked');
+
+ok(!eval { $obj->delete_group({}) }, "Delete - fails on delete of too many groups");
+ok(scalar $obj->find_group({title => 'Bar'}), 'Delete - found group');
+$obj->delete_group({title => 'Bar'});
+ok(!$obj->find_group({title => 'Bar'}), 'Delete - delete_group worked');
+
+$dump = eval { $obj->dump_groups };
+diag($dump);
