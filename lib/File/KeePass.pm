@@ -14,7 +14,8 @@ use Digest::SHA qw(sha256);
 
 use constant DB_HEADER_SIZE   => 124;
 use constant DB_SIG_1         => 0x9AA2D903;
-use constant DB_SIG_2         => 0xB54BFB65;
+use constant DB_SIG_2_v1      => 0xB54BFB65;
+use constant DB_SIG_2_v2      => 0xB54BFB67;
 use constant DB_VER_DW        => 0x00030002;
 use constant DB_FLAG_SHA2     => 1;
 use constant DB_FLAG_RIJNDAEL => 2;
@@ -101,13 +102,7 @@ sub parse_db {
 
     # parse and verify headers
     my $head = $self->parse_header($buffer);
-    die "Wrong sig1 ($head->{'sig1'} != ".DB_SIG_1().")\n" if $head->{'sig1'} != DB_SIG_1;
-    die "Wrong sig2 ($head->{'sig2'} != ".DB_SIG_2().")\n" if $head->{'sig2'} != DB_SIG_2;
-    die "Unsupported File version ($head->{'ver'}).\n" if $head->{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
-    my $enc_type = ($head->{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
-                 : ($head->{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
-                 : die "Unknown encryption type\n";
-    $buffer = substr($buffer, DB_HEADER_SIZE);
+    $buffer = substr($buffer, $head->{'header_size'});
 
     # use the headers to generate our encryption key in conjunction with the password
     my $key = sha256($pass);
@@ -117,10 +112,10 @@ sub parse_db {
     $key = sha256($head->{'seed_rand'}, $key);
 
     # decrypt the buffer
-    if ($enc_type eq 'rijndael') {
+    if ($head->{'enc_type'} eq 'rijndael') {
         $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
     } else {
-        die "Unimplemented enc_type $enc_type";
+        die "Unimplemented enc_type $head->{'enc_type'}";
     }
 
     croak "The file could not be decrypted either because the key is wrong or the file is damaged.\n"
@@ -143,12 +138,73 @@ sub parse_db {
 sub parse_header {
     my ($self, $buffer) = @_;
     my $size = length($buffer);
-    croak "File was smaller than db header ($size < ".DB_HEADER_SIZE().")\n" if $size < DB_HEADER_SIZE;
+    my ($sig1, $sig2) = unpack 'LL', $buffer;
 
-    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
-    my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
-    my %h; @h{@f} = unpack $t, $buffer;
-    return \%h;
+    if ($sig1 != DB_SIG_1) {
+        croak "File signature (sig1) did not match ($sig1 != ".DB_SIG_1().")\n";
+    }
+    elsif ($sig2 eq DB_SIG_2_v1) {
+        croak "File was smaller than db header ($size < ".DB_HEADER_SIZE().")\n" if $size < DB_HEADER_SIZE;
+        my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
+        my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
+        my %h = (version => 1, header_size => DB_HEADER_SIZE);
+        @h{@f} = unpack $t, $buffer;
+        croak "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
+
+        $h{'enc_type'} = ($h{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
+                       : ($h{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
+                       : die "Unknown encryption type\n";
+        return \%h;
+
+    }
+    elsif ($sig2 eq DB_SIG_2_v2) {
+        my %h = (sig1 => $sig1, sig2 => $sig2, version => 2, enc_type => 'rijndael');
+        my $pos = 8;
+        ($h{'ver'}) = unpack "\@$pos L", $buffer;
+        $pos += 4;
+        croak "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
+
+        while (1) {
+            my ($type, $size) = unpack "\@$pos CS", $buffer;
+            $pos += 3;
+            if (!$type) {
+                $pos += $size;
+                last;
+            }
+            my ($val) = unpack "\@$pos a$size", $buffer;
+            $pos += $size;
+            if ($type == 1) {
+                $h{'comment'} = $val;
+            } elsif ($type == 2) {
+                $h{'cipher_id'} = $val;
+            } elsif ($type == 3) {
+                $h{'compression_flags'} = $val;
+            } elsif ($type == 4) {
+                $h{'master_seed'} = $h{'seed_rand'} = unpack 'a16', $val;
+            } elsif ($type == 5) {
+                $h{'seed_key'} = unpack 'a32', $val;
+            } elsif ($type == 6) {
+                $h{'seed_rot_n'} = unpack 'L', $val;
+            } elsif ($type == 7) {
+                $h{'enc_iv'} = unpack 'a16', $val;
+            } elsif ($type == 8) {
+                $h{'protected_stream_key'} = $val;
+            } elsif ($type == 9) {
+                $h{'stream_start_bytes'} = $val;
+            } elsif ($type == 10) {
+                $h{'inner_random_stream_id'} = $val;
+            } else {
+                print "$type, $val\n";
+            }
+        }
+
+        $h{'header_size'} = $pos;
+        croak "Parsing of keepass v2 files is not yet supported.\n";
+        return \%h;
+    }
+    else {
+        die "Second file signature did not match ($sig2 != ".DB_SIG_2_v1()." or ".DB_SIG_2_v2().")\n";
+    }
 }
 
 sub parse_groups {
@@ -182,7 +238,7 @@ sub parse_groups {
             $gmap{$group->{'id'}} = $group;
             my $level = $group->{'level'} || 0;
             if ($previous_level > $level) {
-                splice @gref, $previous_level, $previous_level - $level, ();
+                splice @gref, $level, @gref - $level, ();
                 push @gref, \@groups if !@gref;
             } elsif ($previous_level < $level) {
                 push @gref, ($gref[-1]->[-1]->{'groups'} = []);
@@ -403,7 +459,7 @@ sub gen_db {
 
     $head->{'checksum'} = sha256($buffer);
     $head->{'sig1'}  = DB_SIG_1();
-    $head->{'sig2'}  = DB_SIG_2();
+    $head->{'sig2'}  = DB_SIG_2_v1();
     $head->{'flags'} = DB_FLAG_RIJNDAEL();
     $head->{'ver'}   = DB_VER_DW();
 
