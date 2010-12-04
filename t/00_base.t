@@ -8,10 +8,11 @@
 
 use strict;
 use warnings;
-use Test::More tests => 68;
+use Test::More tests => 69;
 
 use_ok('File::KeePass');
 
+my $dump;
 my $pass = "foo";
 my $obj  = File::KeePass->new;
 ok(!eval { $obj->groups }, "General - No groups until we do something");
@@ -173,7 +174,7 @@ unlink("$file.bak");
 
 ###----------------------------------------------------------------###
 
-my $dump = eval { $obj->dump_groups };
+$dump = eval { $obj->dump_groups };
 diag($dump);
 ok($dump, "General - Ran dump groups");
 
@@ -191,3 +192,30 @@ ok(!$obj->find_group({title => 'Bar'}), 'Delete - delete_group worked');
 
 $dump = eval { $obj->dump_groups };
 diag($dump);
+
+###----------------------------------------------------------------###
+
+# test for correct stack unwinding during the parse_group phase
+my $obj2 = File::KeePass->new;
+my $G = $obj2->add_group({
+    title => 'hello',
+});
+$G = $obj2->add_group({
+    title => 'world',
+    group => $G,
+});
+$G = $obj2->add_group({
+    title => 'i am sam',
+    group => $G,
+});
+$G = $obj2->add_group({
+    title => 'goodbye',
+});
+$dump = eval { $obj2->dump_groups };
+diag($dump);
+
+$ok = $obj2->parse_db($obj2->gen_db($pass), $pass);
+my $dump2 = eval { $obj2->dump_groups };
+#diag($dump);
+is($dump, $dump2, "Dumps should match after gen_db->parse_db");
+#exit;
