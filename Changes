@@ -1,6 +1,6 @@
 0.03
     2010-12-06
-        * Further corrections on parse_groups bug that was further pointed out by Lester Hightower.
+        * Further corrections on parse_groups bug that was further pointed out by Lester Hightower with a correct fix offered Brian De Wolf.
 
 0.02
     2010-12-03
