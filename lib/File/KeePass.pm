@@ -22,7 +22,7 @@ use constant DB_FLAG_RIJNDAEL => 2;
 use constant DB_FLAG_ARCFOUR  => 4;
 use constant DB_FLAG_TWOFISH  => 8;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 my %locker;
 
 sub new {
@@ -214,7 +214,6 @@ sub parse_groups {
     my @groups;
     my %gmap; # allow entries to find their groups (group map)
     my @gref = (\@groups); # group ref pointer stack - let levels nest safely
-    my $previous_level = 0;
     my $group = {};
     while ($n_groups) {
         my $type = unpack 'S', substr($buffer, $pos, 2);
@@ -246,13 +245,11 @@ sub parse_groups {
             $n_groups--;
             $gmap{$group->{'id'}} = $group;
             my $level = $group->{'level'} || 0;
-            if ($previous_level > $level) {
-                splice @gref, $level, @gref - $level, ();
-                push @gref, \@groups if !@gref;
-            } elsif ($previous_level < $level) {
+            if (@gref > $level + 1) { # gref is index base 1 because the root is a pointer to \@groups
+                splice @gref, $level + 1;
+            } elsif (@gref < $level + 1) {
                 push @gref, ($gref[-1]->[-1]->{'groups'} = []);
             }
-            $previous_level = $level;
             push @{ $gref[-1] }, $group;
             $group = {};
         } else {
