@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 69;
+use Test::More tests => 70;
 
 use_ok('File::KeePass');
 
@@ -196,26 +196,35 @@ diag($dump);
 ###----------------------------------------------------------------###
 
 # test for correct stack unwinding during the parse_group phase
+my ($G, $G2, $G3);
 my $obj2 = File::KeePass->new;
-my $G = $obj2->add_group({
-    title => 'hello',
-});
-$G = $obj2->add_group({
-    title => 'world',
-    group => $G,
-});
-$G = $obj2->add_group({
-    title => 'i am sam',
-    group => $G,
-});
-$G = $obj2->add_group({
-    title => 'goodbye',
-});
-$dump = eval { $obj2->dump_groups };
-diag($dump);
-
+$G = $obj2->add_group({ title => 'hello' });
+$G = $obj2->add_group({ title => 'world',    group => $G });
+$G = $obj2->add_group({ title => 'i am sam', group => $G });
+$G = $obj2->add_group({ title => 'goodbye' });
+$dump = "\n".eval { $obj2->dump_groups };
 $ok = $obj2->parse_db($obj2->gen_db($pass), $pass);
-my $dump2 = eval { $obj2->dump_groups };
+my $dump2 = "\n".eval { $obj2->dump_groups };
 #diag($dump);
-is($dump, $dump2, "Dumps should match after gen_db->parse_db");
+is($dump2, $dump, "Dumps should match after gen_db->parse_db") && diag($dump);
 #exit;
+
+###----------------------------------------------------------------###
+
+# test for correct stack unwinding during the parse_group phase
+$obj2 = File::KeePass->new;
+$G  = $obj2->add_group({ title => 'personal' });
+$G2 = $obj2->add_group({ title => 'career',  group => $G  });
+$G2 = $obj2->add_group({ title => 'finance', group => $G  });
+$G3 = $obj2->add_group({ title => 'banking', group => $G2 });
+$G3 = $obj2->add_group({ title => 'credit',  group => $G2 });
+$G2 = $obj2->add_group({ title => 'health',  group => $G  });
+$G2 = $obj2->add_group({ title => 'web',     group => $G  });
+$G3 = $obj2->add_group({ title => 'hosting', group => $G2 });
+$G3 = $obj2->add_group({ title => 'mail',    group => $G2 });
+$G  = $obj2->add_group({ title => 'Foo'      });
+$dump = "\n".eval { $obj2->dump_groups };
+$ok = $obj2->parse_db($obj2->gen_db($pass), $pass);
+$dump2 = "\n".eval { $obj2->dump_groups };
+#diag($dump2);
+is($dump2, $dump, "Dumps should match after gen_db->parse_db") && diag($dump);
