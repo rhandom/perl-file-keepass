@@ -102,14 +102,156 @@ sub parse_db {
 
     # parse and verify headers
     my $head = $self->parse_header($buffer);
-    $buffer = substr($buffer, $head->{'header_size'});
+    $buffer = substr $buffer, $head->{'header_size'};
 
-    # use the headers to generate our encryption key in conjunction with the password
+    $self->unlock if $self->{'groups'}; # make sure we don't leave dangling keys should we reopen a new db
+
+    $self->{'header'} = $head;
+
+    if ($head->{'version'} == 1) {
+        $self->_parse_v1_body($buffer, $pass, $head);
+    } elsif ($head->{'version'} == 2) {
+        $self->_parse_v2_body($buffer, $pass, $head);
+    } else {
+        croak "Unsupported keepass database version ($head->{'version'})\n";
+    }
+
+    $self->lock if $self->auto_lock;
+    return 1;
+}
+
+sub parse_header {
+    my ($self, $buffer) = @_;
+    my ($sig1, $sig2) = unpack 'LL', $buffer;
+
+    if ($sig1 != DB_SIG_1) {
+        croak "File signature (sig1) did not match ($sig1 != ".DB_SIG_1().")\n";
+    }
+    elsif ($sig2 eq DB_SIG_2_v1) {
+        return $self->_parse_v1_header($buffer);
+    }
+    elsif ($sig2 eq DB_SIG_2_v2) {
+        return $self->_parse_v2_header($buffer);
+    }
+    else {
+        die "Second file signature did not match ($sig2 != ".DB_SIG_2_v1()." or ".DB_SIG_2_v2().")\n";
+    }
+}
+
+sub _parse_v1_header {
+    my ($self, $buffer) = @_;
+    my $size = length($buffer);
+    croak "File was smaller than db header ($size < ".DB_HEADER_SIZE().")\n" if $size < DB_HEADER_SIZE;
+    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
+    my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
+    my %h = (version => 1, header_size => DB_HEADER_SIZE);
+    @h{@f} = unpack $t, $buffer;
+    croak "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
+
+    $h{'enc_type'} = ($h{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
+                   : ($h{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
+                   : die "Unknown encryption type\n";
+    return \%h;
+}
+
+sub _parse_v2_header {
+    my ($self, $buffer) = @_;
+    my ($sig1, $sig2) = unpack 'LL', $buffer;
+    my %h = (sig1 => $sig1, sig2 => $sig2, version => 2, enc_type => 'rijndael');
+    my $pos = 8;
+    ($h{'ver'}) = unpack "\@$pos L", $buffer;
+    $pos += 4;
+    croak "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
+
+    while (1) {
+        my ($type, $size) = unpack "\@$pos CS", $buffer;
+        $pos += 3;
+        if (!$type) {
+            $pos += $size;
+            last;
+        }
+        my $val = substr $buffer, $pos, $size; # #my ($val) = unpack "\@$pos a$size", $buffer;
+        $pos += $size;
+        if ($type == 1) {
+            $h{'comment'} = $val;
+        }
+        elsif ($type == 2) {
+            warn "Cipher id did not match AES\n"
+                if $val ne join '', map {chr hex} ("31c1f2e6bf714350be5805216afc5aff" =~ /(..)/g);
+            $h{'cipher_id'} = $val;
+        }
+        elsif ($type == 3) {
+            $val = unpack 'V', $val;
+            warn "Compression was too large.\n" if $val > 1;
+            $h{'compression'} = $val;
+        }
+        elsif ($type == 4) {
+            warn "Length of master seed was not 32\n" if length($val) != 32;
+            $h{'master_seed'} = $h{'seed_rand'} = $val;
+        }
+        elsif ($type == 5) {
+            warn "Length of seed key was not 32\n" if length($val) != 32;
+            $h{'seed_key'} = $val;
+        }
+        elsif ($type == 6) {
+            $h{'seed_rot_n'} = unpack 'L', $val;
+        }
+        elsif ($type == 7) {
+            warn "Length of encryption IV was not 16\n" if length($val) != 16;
+            $h{'enc_iv'} = $val;
+        }
+        elsif ($type == 8) {
+            warn "Length of stream key was not 32\n" if length($val) != 32;
+            $h{'protected_stream_key'} = $val;
+        }
+        elsif ($type == 9) {
+            warn "Length of start bytes was not 32\n" if length($val) != 32;
+            $h{'start_bytes'} = $val;
+        }
+        elsif ($type == 10) {
+            $val = unpack 'V', $val;
+            warn "Inner stream id did not match Salsa20\n" if $val != 2;
+            $h{'inner_random_stream_id'} = $val;
+        }
+        else {
+            warn "Found an unknown header type ($type, $val)\n";
+        }
+    }
+
+    $h{'header_size'} = $pos;
+    return \%h;
+}
+
+###----------------------------------------------------------------###
+
+sub _master_v1_key {
+    my ($self, $pass, $head) = @_;
     my $key = sha256($pass);
     my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
-    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'}; # i suppose this introduces cryptographic overhead
+    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
     $key = sha256($key);
     $key = sha256($head->{'seed_rand'}, $key);
+    return $key;
+}
+
+sub _master_v2_key {
+    my ($self, $pass, $head) = @_;
+    my $key = sha256($pass);
+    $key = sha256($key, ()); # this represents the joining of composite data - eventually this would add in File based key as well
+    my $left  = substr $key,  0, 16;
+    my $right = substr $key, 16, 16;
+    my $cipher_l = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
+    my $cipher_r = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
+    $left  = $cipher_l->encrypt($left)  for 1 .. $head->{'seed_rot_n'};
+    $right = $cipher_r->encrypt($right) for 1 .. $head->{'seed_rot_n'}; # theoretically we could parallelize this in separate thread
+    $key = sha256($head->{'master_seed'}, sha256("$left$right"));
+    return $key;
+}
+
+sub _parse_v1_body {
+    my ($self, $buffer, $pass, $head) = @_;
+
+    my $key = $self->_master_v1_key($pass, $head);
 
     # decrypt the buffer
     if ($head->{'enc_type'} eq 'rijndael') {
@@ -124,90 +266,72 @@ sub parse_db {
         if $head->{'checksum'} ne sha256($buffer);
 
     # read the db
-    my ($groups, $gmap, $pos) = $self->parse_groups($buffer, $head->{'n_groups'});
-    $self->parse_entries($buffer, $head->{'n_entries'}, $pos, $gmap, $groups);
-
-    $self->{'header'} = $head;
-
-    $self->unlock if $self->{'groups'}; # make sure we don't leave dangling keys should we reopen a new db
+    my ($groups, $gmap, $pos) = $self->_parse_v1_groups($buffer, $head->{'n_groups'});
     $self->{'groups'} = $groups;
-    $self->lock if $self->auto_lock;
-    return 1;
+    $self->_parse_v1_entries($buffer, $head->{'n_entries'}, $pos, $gmap, $groups);
 }
 
-sub parse_header {
-    my ($self, $buffer) = @_;
-    my $size = length($buffer);
-    my ($sig1, $sig2) = unpack 'LL', $buffer;
+sub _parse_v2_body {
+    my ($self, $buffer, $pass, $head) = @_;
 
-    if ($sig1 != DB_SIG_1) {
-        croak "File signature (sig1) did not match ($sig1 != ".DB_SIG_1().")\n";
+    my $key = $self->_master_v2_key($pass, $head);
+
+    $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
+
+    my $start = substr($buffer, 0, 32, '');
+    if ($start ne $head->{'start_bytes'}) {
+        croak "The database key appears invalid or else the database is corrupt.\n";
     }
-    elsif ($sig2 eq DB_SIG_2_v1) {
-        croak "File was smaller than db header ($size < ".DB_HEADER_SIZE().")\n" if $size < DB_HEADER_SIZE;
-        my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
-        my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
-        my %h = (version => 1, header_size => DB_HEADER_SIZE);
-        @h{@f} = unpack $t, $buffer;
-        croak "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
 
-        $h{'enc_type'} = ($h{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
-                       : ($h{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
-                       : die "Unknown encryption type\n";
-        return \%h;
-
-    }
-    elsif ($sig2 eq DB_SIG_2_v2) {
-        my %h = (sig1 => $sig1, sig2 => $sig2, version => 2, enc_type => 'rijndael');
-        my $pos = 8;
-        ($h{'ver'}) = unpack "\@$pos L", $buffer;
+    # Hash block chunking
+    my $new = '';
+    my $pos = 0;
+    while ($pos < length($buffer)) {
+        my $index = unpack "\@$pos L", $buffer;
         $pos += 4;
-        croak "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
 
-        while (1) {
-            my ($type, $size) = unpack "\@$pos CS", $buffer;
-            $pos += 3;
-            if (!$type) {
-                $pos += $size;
-                last;
-            }
-            my ($val) = unpack "\@$pos a$size", $buffer;
-            $pos += $size;
-            if ($type == 1) {
-                $h{'comment'} = $val;
-            } elsif ($type == 2) {
-                $h{'cipher_id'} = $val;
-            } elsif ($type == 3) {
-                $h{'compression_flags'} = $val;
-            } elsif ($type == 4) {
-                $h{'master_seed'} = $h{'seed_rand'} = unpack 'a16', $val;
-            } elsif ($type == 5) {
-                $h{'seed_key'} = unpack 'a32', $val;
-            } elsif ($type == 6) {
-                $h{'seed_rot_n'} = unpack 'L', $val;
-            } elsif ($type == 7) {
-                $h{'enc_iv'} = unpack 'a16', $val;
-            } elsif ($type == 8) {
-                $h{'protected_stream_key'} = $val;
-            } elsif ($type == 9) {
-                $h{'stream_start_bytes'} = $val;
-            } elsif ($type == 10) {
-                $h{'inner_random_stream_id'} = $val;
-            } else {
-                print "$type, $val\n";
-            }
+        my $hash = substr $buffer, $pos, 32;
+        $pos += 32;
+
+        my $size = unpack "\@$pos i", $buffer;
+        $pos += 4;
+
+        if ($size == 0) {
+            warn "Found mismatch for 0 chunksize\n" if $hash !~ /^\x00{32}$/;
+            last;
         }
 
-        $h{'header_size'} = $pos;
-        croak "Parsing of keepass v2 files is not yet supported.\n";
-        return \%h;
+        my $chunk = substr $buffer, $pos, $size;
+        if ($hash ne sha256($chunk)) {
+            die "Chunk hash did not match\n";
+        }
+        $pos += $size;
+        $new .= $chunk;
     }
-    else {
-        die "Second file signature did not match ($sig2 != ".DB_SIG_2_v1()." or ".DB_SIG_2_v2().")\n";
+    $buffer = $new;
+    $new = '';
+
+    if ($head->{'compression'} == 1) {
+        eval { require Compress::Zlib } or croak "Cannot load compression library to decompress database: $@";
+        my ($i, $status) = Compress::Zlib::inflateInit(-WindowBits => 31);
+        croak "Failed to initialize inflator ($status)\n" if $status != Compress::Zlib::Z_OK();
+        ($buffer, $status) = $i->inflate($buffer);
+        croak "Failed to uncompress XML ($status)\n" if $status != Compress::Zlib::Z_STREAM_END();
+    } elsif (!defined($head->{'compression'}) || $head->{'compression'} != 0) {
+        croak "Unknown compression type.\n";
     }
+
+    eval { require XML::Simple } or croak "Cannot load XML library to parse database: $@";
+    my $data = XML::Simple::XMLin($buffer);
+
+    use CGI::Ex::Dump qw(debug);
+    debug $data;
+
 }
 
-sub parse_groups {
+###----------------------------------------------------------------###
+
+sub _parse_v1_groups {
     my ($self, $buffer, $n_groups) = @_;
     my $pos = 0;
 
@@ -229,13 +353,13 @@ sub parse_groups {
         } elsif ($type == 2) {
             ($group->{'title'}   = substr($buffer, $pos, $size)) =~ s/\0$//;
         } elsif ($type == 3) {
-            $group->{'created'}  = $self->parse_date(substr($buffer, $pos, $size));
+            $group->{'created'}  = $self->_parse_v1_date(substr($buffer, $pos, $size));
         } elsif ($type == 4) {
-            $group->{'modified'} = $self->parse_date(substr($buffer, $pos, $size));
+            $group->{'modified'} = $self->_parse_v1_date(substr($buffer, $pos, $size));
         } elsif ($type == 5) {
-            $group->{'accessed'} = $self->parse_date(substr($buffer, $pos, $size));
+            $group->{'accessed'} = $self->_parse_v1_date(substr($buffer, $pos, $size));
         } elsif ($type == 6) {
-            $group->{'expires'}  = $self->parse_date(substr($buffer, $pos, $size));
+            $group->{'expires'}  = $self->_parse_v1_date(substr($buffer, $pos, $size));
         } elsif ($type == 7) {
             $group->{'icon'}     = unpack 'L', substr($buffer, $pos, 4);
         } elsif ($type == 8) {
@@ -261,7 +385,7 @@ sub parse_groups {
     return (\@groups, \%gmap, $pos);
 }
 
-sub parse_entries {
+sub _parse_v1_entries {
     my ($self, $buffer, $n_entries, $pos, $gmap, $groups) = @_;
 
     my $entry = {};
@@ -291,13 +415,13 @@ sub parse_entries {
         } elsif ($type == 8) {
             ($entry->{'comment'}  = substr($buffer, $pos, $size)) =~ s/\0$//;
         } elsif ($type == 9) {
-            $entry->{'created'}   = $self->parse_date(substr($buffer, $pos, $size));
+            $entry->{'created'}   = $self->_parse_v1_date(substr($buffer, $pos, $size));
         } elsif ($type == 0xA) {
-            $entry->{'modified'}  = $self->parse_date(substr($buffer, $pos, $size));
+            $entry->{'modified'}  = $self->_parse_v1_date(substr($buffer, $pos, $size));
         } elsif ($type == 0xB) {
-            $entry->{'accessed'}  = $self->parse_date(substr($buffer, $pos, $size));
+            $entry->{'accessed'}  = $self->_parse_v1_date(substr($buffer, $pos, $size));
         } elsif ($type == 0xC) {
-            $entry->{'expires'}   = $self->parse_date(substr($buffer, $pos, $size));
+            $entry->{'expires'}   = $self->_parse_v1_date(substr($buffer, $pos, $size));
 	} elsif ($type == 0xD) {
             ($entry->{'bin_desc'} = substr($buffer, $pos, $size)) =~ s/\0$//;
 	} elsif ($type == 0xE) {
@@ -343,7 +467,7 @@ sub parse_entries {
     }
 }
 
-sub parse_date {
+sub _parse_v1_date {
     my ($self, $packed) = @_;
     my @b = unpack('C*', $packed);
     my $year = ($b[0] << 6) | ($b[1] >> 2);
@@ -378,7 +502,7 @@ sub encrypt_rijndael_cbc {
 
 ###----------------------------------------------------------------###
 
-sub gen_date {
+sub _gen_v1_date {
     my ($self, $date) = @_;
     return "\0\0\0\0\0" if ! $date;
     my ($year, $mon, $day, $hour, $min, $sec) = $date =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/ ? ($1,$2,$3,$4,$5,$6) : die "Invalid date ($date)";
@@ -392,12 +516,11 @@ sub gen_date {
 }
 
 sub gen_db {
-    my $self = shift;
-    my $pass = shift;
+    my ($self, $pass, $groups, $head) = @_;
+    $groups ||= $self->groups;
+    $head   ||= {};
     croak "Missing pass\n" if ! defined($pass);
-    my $groups = shift || $self->groups;
     croak "Please unlock before calling gen_db" if $self->is_locked($groups);
-    my $head   = shift || {};
 
     srand((time() ^ $$) * rand()) if ! $self->{'srand'};
     foreach my $key (qw(seed_rand enc_iv)) {
@@ -407,13 +530,20 @@ sub gen_db {
     }
     $head->{'seed_key'}   = sha256(time.rand().$$) if ! defined $head->{'seed_key'};
     $head->{'seed_rot_n'} = 50_000 if ! defined $head->{'seed_rot_n'};
+    $head->{'sig1'}       = DB_SIG_1();
+    $head->{'sig2'}       = DB_SIG_2_v1();
 
-    # use the headers to generate our encryption key in conjunction with the password
-    my $key = sha256($pass);
-    my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
-    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
-    $key = sha256($key);
-    $key = sha256($head->{'seed_rand'}, $key);
+    if (($head->{'version'} || $self->{'version'} || '') == 2) {
+        return $self->_gen_v2_db($pass, $groups, $head);
+    } else {
+        return $self->_gen_v1_db($pass, $groups, $head);
+    }
+}
+
+sub _gen_v1_db {
+    my ($self, $pass, $groups, $head) = @_;
+
+    my $key = $self->_master_key($pass, $head);
 
     my $buffer  = '';
     my $entries = '';
@@ -435,10 +565,10 @@ sub gen_db {
         $head->{'n_groups'}++;
         my @d = ([1,      pack('LL', 4, $g->{'id'})],
                  [2,      pack('L', length($g->{'title'})+1)."$g->{'title'}\0"],
-                 [3,      pack('L',  5). $self->gen_date($g->{'created'}  || $self->now)],
-                 [4,      pack('L',  5). $self->gen_date($g->{'modified'} || $self->now)],
-                 [5,      pack('L',  5). $self->gen_date($g->{'accessed'} || $self->now)],
-                 [6,      pack('L',  5). $self->gen_date($g->{'expires'}  || $self->default_exp)],
+                 [3,      pack('L',  5). $self->_gen_v1_date($g->{'created'}  || $self->now)],
+                 [4,      pack('L',  5). $self->_gen_v1_date($g->{'modified'} || $self->now)],
+                 [5,      pack('L',  5). $self->_gen_v1_date($g->{'accessed'} || $self->now)],
+                 [6,      pack('L',  5). $self->_gen_v1_date($g->{'expires'}  || $self->default_exp)],
                  [7,      pack('LL', 4, $g->{'icon'}  || 0)],
                  [8,      pack('LS', 2, $g->{'level'} || 0)],
                  [0xFFFF, pack('L', 0)]);
@@ -455,10 +585,10 @@ sub gen_db {
                      [6,      pack('L', length($e->{'username'})+1). "$e->{'username'}\0"],
                      [7,      pack('L', length($e->{'password'})+1). "$e->{'password'}\0"],
                      [8,      pack('L', length($e->{'comment'})+1).  "$e->{'comment'}\0"],
-                     [9,      pack('L', 5). $self->gen_date($e->{'created'}  || $self->now)],
-                     [0xA,    pack('L', 5). $self->gen_date($e->{'modified'} || $self->now)],
-                     [0xB,    pack('L', 5). $self->gen_date($e->{'accessed'} || $self->now)],
-                     [0xC,    pack('L', 5). $self->gen_date($e->{'expires'}  || $self->default_exp)],
+                     [9,      pack('L', 5). $self->_gen_v1_date($e->{'created'}  || $self->now)],
+                     [0xA,    pack('L', 5). $self->_gen_v1_date($e->{'modified'} || $self->now)],
+                     [0xB,    pack('L', 5). $self->_gen_v1_date($e->{'accessed'} || $self->now)],
+                     [0xC,    pack('L', 5). $self->_gen_v1_date($e->{'expires'}  || $self->default_exp)],
                      [0xD,    pack('L', length($e->{'bin_desc'})+1)."$e->{'bin_desc'}\0"],
                      [0xE,    pack('L', length($e->{'binary'})).$e->{'binary'}],
                      [0xFFFF, pack('L', 0)]);
@@ -469,8 +599,6 @@ sub gen_db {
     $buffer .= $entries; $entries = '';
 
     $head->{'checksum'} = sha256($buffer);
-    $head->{'sig1'}  = DB_SIG_1();
-    $head->{'sig2'}  = DB_SIG_2_v1();
     $head->{'flags'} = DB_FLAG_RIJNDAEL();
     $head->{'ver'}   = DB_VER_DW();
 
@@ -822,15 +950,15 @@ The resulting database can be accessed via various methods including $k->groups.
 
 Used by parse_db.
 
-=item parse_groups
+=item _parse_v1_groups
 
 Used by parse_db.
 
-=item parse_entries
+=item _parse_v1_entries
 
 Used by parse_db.
 
-=item parse_date
+=item _parse_v1_date
 
 Parses a kdb packed date.
 
@@ -856,7 +984,7 @@ is currently locked.
 
 Returns a kdb file header.
 
-=item gen_date
+=item _gen_v1_date
 
 Returns a kdb packed date.
 
@@ -1060,6 +1188,12 @@ source code is published under the GPL2 license.  KeePassX 0.4.3 bears the copyr
 
     Copyright (C) 2005-2008 Tarek Saidi <tarek.saidi@arcor.de>
     Copyright (C) 2007-2009 Felix Geyer <debfx-keepassx {at} fobos.de>
+
+Knowledge about the KeePass DB v2 format was gleaned from the source code of keepassx-2.0-alpha1.  That
+source code is published under the GPL2 or GPL3 license.  KeePassX 2.0-alpha1 bears the copyright of
+
+    Copyright: 2010-2012, Felix Geyer <debfx@fobos.de>
+               2011-2012, Florian Geyer <blueice@fobos.de>
 
 The encryption/decryption algorithms of File::KeePass are of derivative nature from KeePassX and could
 not have been created without this insight - though the perl code is from scratch.
