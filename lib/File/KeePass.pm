@@ -55,8 +55,14 @@ sub save_db {
     my $self = shift;
     my $file = shift || croak "Missing file\n";
     my $pass = shift || croak "Missing pass\n";
+    my $args = shift || {};
+    local $args->{'version'} = $args->{'version'}  ? $args->{'version'}
+                             : $file =~ /\.kdbx$/i ? 2
+                             : $file =~ /\.kdb$/i  ? 1
+                             : $self->{'header'}   ? $self->{'header'}->{'header'}
+                             : $self->{'version'};
 
-    my $buf = $self->gen_db($pass);
+    my $buf = $self->gen_db($pass, undef, $args);
     my $bak = "$file.bak";
     my $tmp = "$file.new.".int(time());
     open(my $fh, '>', $tmp) || croak "Couldn't open $tmp: $!\n";
@@ -543,7 +549,7 @@ sub gen_db {
 sub _gen_v1_db {
     my ($self, $pass, $groups, $head) = @_;
 
-    my $key = $self->_master_key($pass, $head);
+    my $key = $self->_master_v1_key($pass, $head);
 
     my $buffer  = '';
     my $entries = '';
