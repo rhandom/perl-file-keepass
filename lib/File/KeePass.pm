@@ -317,7 +317,8 @@ sub _parse_v2_body {
 
     eval { require XML::Simple } or croak "Cannot load XML library to parse database: $@";
     my $data = XML::Simple::XMLin($buffer,
-                                  ForceArray => [qw(Group Entry String)],
+                                  ForceArray => [qw(Group Entry String Association)],
+                                  SuppressEmpty => '',
                                   GroupTags  => {
                                       Binaries => 'Binary',
                                   });
@@ -348,7 +349,7 @@ sub _parse_v2_body {
                     enable_auto_type  => $tri->($ginfo->{'EnableAutoType'}),
                     enable_searching  => $tri->($ginfo->{'EnableSearching'}),
                     last_top_entry    => $ginfo->{'LastTopVisibleEntry'},
-                    custom_icon_uuid  => $einfo->{'CustomIconUUID'},
+                    custom_icon_uuid  => $ginfo->{'CustomIconUUID'},
                     expires           => $tri->($ginfo->{'Expires'}),
                     location_changed  => $self->_parse_v2_date($ginfo->{'Times'}->{'LocationChanged'}),
                     usage_count       => $ginfo->{'Times'}->{'UsageCount'},
@@ -359,19 +360,19 @@ sub _parse_v2_body {
             $group->{'v2_raw'} = $ginfo if $self->{'keep_xml'};
             push @groups, $group;
             foreach my $einfo (@{ $ginfo->{'Entry'} || [] }) {
-                my %str = map {lc($_->{'Key'}) => $_->{'Value'}} @{ $einfo->{'String'} || [] };
+                my %str = map {$_->{'Key'} => $_->{'Value'}} @{ $einfo->{'String'} || [] };
                 my $entry = {
                     accessed => $self->_parse_v2_date($einfo->{'Times'}->{'LastAccessTime'}),
                     created  => $self->_parse_v2_date($einfo->{'Times'}->{'CreationTime'}),
                     expires  => $self->_parse_v2_date($einfo->{'Times'}->{'ExpiryTime'}),
                     modified => $self->_parse_v2_date($einfo->{'Times'}->{'LastModificationTime'}),
-                    comment  => $str{'notes'},
+                    comment  => delete($str{'Notes'}),
                     icon     => $einfo->{'IconID'},
                     id       => $einfo->{'UUID'},
-                    title    => $str{'title'},
-                    url      => $str{'url'},
-                    username => $str{'username'},
-                    password => $str{'password'},
+                    title    => delete($str{'Title'}),
+                    url      => delete($str{'URL'}),
+                    username => delete($str{'UserName'}),
+                    password => delete($str{'Password'}),
                     binary   => $einfo->{'Binary'},
                     v2_extra => {
                         expires           => $tri->($einfo->{'Expires'}),
@@ -387,6 +388,7 @@ sub _parse_v2_body {
                     },
                 };
                 $entry->{'v2_raw'} = $einfo if $self->{'keep_xml'};
+                $entry->{'v2_extra'}->{'strings'} = \%str if scalar keys %str;
                 push @{ $group->{'entries'} }, $entry;
             }
             my $subgroups = $rec->($ginfo->{'Group'}, $level + 1);
