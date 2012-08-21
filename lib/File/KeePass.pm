@@ -306,26 +306,34 @@ sub _parse_v2_body {
     $new = '';
 
     if ($head->{'compression'} == 1) {
-        eval { require Compress::Zlib } or croak "Cannot load compression library to decompress database: $@";
-        my ($i, $status) = Compress::Zlib::inflateInit(-WindowBits => 31);
-        croak "Failed to initialize inflator ($status)\n" if $status != Compress::Zlib::Z_OK();
-        ($buffer, $status) = $i->inflate($buffer);
-        croak "Failed to uncompress XML ($status)\n" if $status != Compress::Zlib::Z_STREAM_END();
+        $buffer = $self->decompress($buffer);
     } elsif (!defined($head->{'compression'}) || $head->{'compression'} != 0) {
         croak "Unknown compression type.\n";
     }
 
     eval { require XML::Simple } or croak "Cannot load XML library to parse database: $@";
     my $data = XML::Simple::XMLin($buffer,
-                                  ForceArray => [qw(Group Entry String Association)],
+                                  ForceArray => [qw(Group Entry String Association Binaries Binary)],
                                   SuppressEmpty => '',
-                                  GroupTags  => {
-                                      Binaries => 'Binary',
-                                  });
+                                  );
 
     $self->{'xml'} = $data if $self->{'keep_xml'};
 
     $head->{'v2_meta'} = $data->{'Meta'} || {};
+
+    # allow for arbitrary files stored as part of the zip
+    my %BIN;
+    for my $bins (@{ delete($head->{'v2_meta'}->{'Binaries'}) || [] }) {
+        for my $bin (@{ $bins->{'Binary'} || [] }) {
+            my ($content, $id, $comp) = @$bin{qw(content ID Compressed)};
+            $content = $self->decode_base64($content);
+            if ($comp && $comp eq 'True') {
+                eval { $content = $self->decompress($content) } or warn "Could not decompress associated binary ($id): $@";
+            }
+            warn "Duplicate binary id $id - using most recent.\n" if exists $head->{'v2_meta'}->{'binaries'}->{$id};
+            $BIN{$id} = $content;
+        }
+    }
 
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
     my $rec; $rec = sub {
@@ -373,7 +381,6 @@ sub _parse_v2_body {
                     url      => delete($str{'URL'}),
                     username => delete($str{'UserName'}),
                     password => delete($str{'Password'}),
-                    binary   => $einfo->{'Binary'},
                     v2_extra => {
                         expires           => $tri->($einfo->{'Expires'}),
                         location_changed  => $self->_parse_v2_date($einfo->{'Times'}->{'LocationChanged'}),
@@ -389,6 +396,12 @@ sub _parse_v2_body {
                 };
                 $entry->{'v2_raw'} = $einfo if $self->{'keep_xml'};
                 $entry->{'v2_extra'}->{'strings'} = \%str if scalar keys %str;
+                foreach my $bin (@{ $einfo->{'Binary'} || [] }) {
+                    my $key = $bin->{'Key'};
+                    $key = do { warn "Missing key for binary."; 'unknown' } if ! defined $key;
+                    warn "Duplicate binary key for entry." if $entry->{'binary'}->{$key};
+                    $entry->{'binary'}->{$key} = $BIN{$bin->{'Value'}->{'Ref'}};
+                }
                 push @{ $group->{'entries'} }, $entry;
             }
             my $subgroups = $rec->($ginfo->{'Group'}, $level + 1);
@@ -573,6 +586,22 @@ sub encrypt_rijndael_cbc {
     my $extra = (16 - length($buffer) % 16) || 16; # always pad so we can always trim
     $buffer .= chr($extra) for 1 .. $extra;
     return $cipher->encrypt($buffer);
+}
+
+sub decompress {
+    my ($self, $buffer) = @_;
+    eval { require Compress::Zlib } or croak "Cannot load compression library to decompress database: $@";
+    my ($i, $status) = Compress::Zlib::inflateInit(-WindowBits => 31);
+    croak "Failed to initialize inflator ($status)\n" if $status != Compress::Zlib::Z_OK();
+    ($buffer, $status) = $i->inflate($buffer);
+    croak "Failed to uncompress buffer ($status)\n" if $status != Compress::Zlib::Z_STREAM_END();
+    return $buffer;
+}
+
+sub decode_base64 {
+    my ($self, $content) = @_;
+    eval { require MIME::Base64 } or croak "Cannot load Base64 library to decode item: $@";
+    return MIME::Base64::decode_base64($content);
 }
 
 ###----------------------------------------------------------------###
@@ -918,6 +947,13 @@ sub locked_entry_password {
     $entry->{'accessed'} = $self->now;
     return $pass;
 }
+
+###----------------------------------------------------------------###
+
+sub decrypt_salsa20 {
+    my ($self, $enc, $key, $iv) = @_;
+}
+
 
 ###----------------------------------------------------------------###
 
