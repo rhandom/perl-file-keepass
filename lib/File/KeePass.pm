@@ -316,7 +316,12 @@ sub _parse_v2_body {
     }
 
     eval { require XML::Simple } or croak "Cannot load XML library to parse database: $@";
-    my $data = XML::Simple::XMLin($buffer, ForceArray => [qw(Group Entry String)]);
+    my $data = XML::Simple::XMLin($buffer,
+                                  ForceArray => [qw(Group Entry String)],
+                                  GroupTags  => {
+                                      Binaries => 'Binary',
+                                  });
+
     $self->{'xml'} = $data if $self->{'keep_xml'};
 
     $head->{'v2_meta'} = $data->{'Meta'} || {};
@@ -343,6 +348,7 @@ sub _parse_v2_body {
                     enable_auto_type  => $tri->($ginfo->{'EnableAutoType'}),
                     enable_searching  => $tri->($ginfo->{'EnableSearching'}),
                     last_top_entry    => $ginfo->{'LastTopVisibleEntry'},
+                    custom_icon_uuid  => $einfo->{'CustomIconUUID'},
                     expires           => $tri->($ginfo->{'Expires'}),
                     location_changed  => $self->_parse_v2_date($ginfo->{'Times'}->{'LocationChanged'}),
                     usage_count       => $ginfo->{'Times'}->{'UsageCount'},
@@ -366,6 +372,7 @@ sub _parse_v2_body {
                     url      => $str{'url'},
                     username => $str{'username'},
                     password => $str{'password'},
+                    binary   => $einfo->{'Binary'},
                     v2_extra => {
                         expires           => $tri->($einfo->{'Expires'}),
                         location_changed  => $self->_parse_v2_date($einfo->{'Times'}->{'LocationChanged'}),
@@ -373,6 +380,7 @@ sub _parse_v2_body {
                         tags              => $einfo->{'Tags'},
                         background_color  => $einfo->{'BackgroundColor'},
                         foreground_color  => $einfo->{'ForegroundColor'},
+                        custom_icon_uuid  => $einfo->{'CustomIconUUID'},
                         history           => $einfo->{'History'},
                         override_url      => $einfo->{'OverrideURL'},
                         auto_type         => $einfo->{'AutoType'},
