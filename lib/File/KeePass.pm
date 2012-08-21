@@ -115,9 +115,9 @@ sub parse_db {
     $self->{'header'} = $head;
 
     if ($head->{'version'} == 1) {
-        $self->_parse_v1_body($buffer, $pass, $head);
+        $self->{'groups'} = $self->_parse_v1_body($buffer, $pass, $head);
     } elsif ($head->{'version'} == 2) {
-        $self->_parse_v2_body($buffer, $pass, $head);
+        $self->{'groups'} = $self->_parse_v2_body($buffer, $pass, $head);
     } else {
         croak "Unsupported keepass database version ($head->{'version'})\n";
     }
@@ -192,8 +192,8 @@ sub _parse_v2_header {
             $h{'compression'} = $val;
         }
         elsif ($type == 4) {
-            warn "Length of master seed was not 32\n" if length($val) != 32;
-            $h{'master_seed'} = $h{'seed_rand'} = $val;
+            warn "Length of seed random was not 32\n" if length($val) != 32;
+            $h{'seed_rand'} = $val;
         }
         elsif ($type == 5) {
             warn "Length of seed key was not 32\n" if length($val) != 32;
@@ -244,13 +244,10 @@ sub _master_v2_key {
     my ($self, $pass, $head) = @_;
     my $key = sha256($pass);
     $key = sha256($key, ()); # this represents the joining of composite data - eventually this would add in File based key as well
-    my $left  = substr $key,  0, 16;
-    my $right = substr $key, 16, 16;
-    my $cipher_l = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
-    my $cipher_r = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
-    $left  = $cipher_l->encrypt($left)  for 1 .. $head->{'seed_rot_n'};
-    $right = $cipher_r->encrypt($right) for 1 .. $head->{'seed_rot_n'}; # theoretically we could parallelize this in separate thread
-    $key = sha256($head->{'master_seed'}, sha256("$left$right"));
+    my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
+    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
+    $key = sha256($key);
+    $key = sha256($head->{'seed_rand'}, $key);
     return $key;
 }
 
@@ -273,8 +270,8 @@ sub _parse_v1_body {
 
     # read the db
     my ($groups, $gmap, $pos) = $self->_parse_v1_groups($buffer, $head->{'n_groups'});
-    $self->{'groups'} = $groups;
     $self->_parse_v1_entries($buffer, $head->{'n_entries'}, $pos, $gmap, $groups);
+    return $groups;
 }
 
 sub _parse_v2_body {
@@ -293,24 +290,15 @@ sub _parse_v2_body {
     my $new = '';
     my $pos = 0;
     while ($pos < length($buffer)) {
-        my $index = unpack "\@$pos L", $buffer;
-        $pos += 4;
-
-        my $hash = substr $buffer, $pos, 32;
-        $pos += 32;
-
-        my $size = unpack "\@$pos i", $buffer;
-        $pos += 4;
-
+        my ($index, $hash, $size) = unpack "\@$pos L a32 i", $buffer;
+        $pos += 40;
         if ($size == 0) {
             warn "Found mismatch for 0 chunksize\n" if $hash !~ /^\x00{32}$/;
             last;
         }
 
         my $chunk = substr $buffer, $pos, $size;
-        if ($hash ne sha256($chunk)) {
-            die "Chunk hash did not match\n";
-        }
+        croak "Chunk hash of index $index did not match\n" if $hash ne sha256($chunk);
         $pos += $size;
         $new .= $chunk;
     }
@@ -328,11 +316,77 @@ sub _parse_v2_body {
     }
 
     eval { require XML::Simple } or croak "Cannot load XML library to parse database: $@";
-    my $data = XML::Simple::XMLin($buffer);
+    my $data = XML::Simple::XMLin($buffer, ForceArray => [qw(Group Entry String)]);
+    $self->{'xml'} = $data if $self->{'keep_xml'};
 
-    use CGI::Ex::Dump qw(debug);
-    debug $data;
+    $head->{'v2_meta'} = $data->{'Meta'} || {};
 
+    my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
+    my $rec; $rec = sub {
+        my $node  = shift || return;
+        my $level = shift || 0;
+
+        my @groups;
+        foreach my $ginfo (@$node) {
+            my $group = {
+                id       => $ginfo->{'UUID'},
+                icon     => $ginfo->{'IconID'},
+                title    => $ginfo->{'Name'},
+                expanded => $tri->($ginfo->{'IsExpanded'}),
+                level    => $level,
+                accessed => $self->_parse_v2_date($ginfo->{'Times'}->{'LastAccessTime'}),
+                expires  => $self->_parse_v2_date($ginfo->{'Times'}->{'ExpiryTime'}),
+                created  => $self->_parse_v2_date($ginfo->{'Times'}->{'CreationTime'}),
+                modified => $self->_parse_v2_date($ginfo->{'Times'}->{'LastModificationTime'}),
+                v2_extra => {
+                    default_auto_type => $ginfo->{'DefaultAutoTypeSequence'},
+                    enable_auto_type  => $tri->($ginfo->{'EnableAutoType'}),
+                    enable_searching  => $tri->($ginfo->{'EnableSearching'}),
+                    last_top_entry    => $ginfo->{'LastTopVisibleEntry'},
+                    expires           => $tri->($ginfo->{'Expires'}),
+                    location_changed  => $self->_parse_v2_date($ginfo->{'Times'}->{'LocationChanged'}),
+                    usage_count       => $ginfo->{'Times'}->{'UsageCount'},
+                    notes             => $ginfo->{'Notes'},
+                },
+                entries => [],
+            };
+            $group->{'v2_raw'} = $ginfo if $self->{'keep_xml'};
+            push @groups, $group;
+            foreach my $einfo (@{ $ginfo->{'Entry'} || [] }) {
+                my %str = map {lc($_->{'Key'}) => $_->{'Value'}} @{ $einfo->{'String'} || [] };
+                my $entry = {
+                    accessed => $self->_parse_v2_date($einfo->{'Times'}->{'LastAccessTime'}),
+                    created  => $self->_parse_v2_date($einfo->{'Times'}->{'CreationTime'}),
+                    expires  => $self->_parse_v2_date($einfo->{'Times'}->{'ExpiryTime'}),
+                    modified => $self->_parse_v2_date($einfo->{'Times'}->{'LastModificationTime'}),
+                    comment  => $str{'notes'},
+                    icon     => $einfo->{'IconID'},
+                    id       => $einfo->{'UUID'},
+                    title    => $str{'title'},
+                    url      => $str{'url'},
+                    username => $str{'username'},
+                    password => $str{'password'},
+                    v2_extra => {
+                        expires           => $tri->($einfo->{'Expires'}),
+                        location_changed  => $self->_parse_v2_date($einfo->{'Times'}->{'LocationChanged'}),
+                        usage_count       => $einfo->{'Times'}->{'UsageCount'},
+                        tags              => $einfo->{'Tags'},
+                        background_color  => $einfo->{'BackgroundColor'},
+                        foreground_color  => $einfo->{'ForegroundColor'},
+                        history           => $einfo->{'History'},
+                        override_url      => $einfo->{'OverrideURL'},
+                        auto_type         => $einfo->{'AutoType'},
+                    },
+                };
+                $entry->{'v2_raw'} = $einfo if $self->{'keep_xml'};
+                push @{ $group->{'entries'} }, $entry;
+            }
+            my $subgroups = $rec->($ginfo->{'Group'}, $level + 1);
+            $group->{'groups'} = $subgroups if $subgroups && @$subgroups;
+        }
+        return \@groups;
+    };
+    return $rec->($data->{'Root'}->{'Group'}) || [];
 }
 
 ###----------------------------------------------------------------###
@@ -483,6 +537,11 @@ sub _parse_v1_date {
     my $min  = (($b[3] & 0b1111)   << 2) | ($b[4] >> 6);
     my $sec  = (($b[4] & 0b111111));
     return sprintf "%04d-%02d-%02d %02d:%02d:%02d", $year, $mon, $day, $hour, $min, $sec;
+}
+
+sub _parse_v2_date {
+    my ($self, $date) = @_;
+    return ($date && $date =~ /^(\d\d\d\d-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)Z?$/) ? "$1 $2" : '';
 }
 
 ###----------------------------------------------------------------###
