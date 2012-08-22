@@ -24,6 +24,7 @@ use constant DB_FLAG_TWOFISH  => 8;
 
 our $VERSION = '0.03';
 my %locker;
+my $salsa20_iv = "\xe8\x30\x09\x4b\x97\x20\x5d\x2a";
 
 sub new {
     my $class = shift;
@@ -311,19 +312,73 @@ sub _parse_v2_body {
         croak "Unknown compression type.\n";
     }
 
-    eval { require XML::Simple } or croak "Cannot load XML library to parse database: $@";
-    my $data = XML::Simple::XMLin($buffer,
-                                  ForceArray => [qw(Group Entry String Association Binaries Binary)],
-                                  SuppressEmpty => '',
-                                  );
+    eval { require XML::Parser } or croak "Cannot load XML library to parse database: $@";
+    my (@groups, @gstack);
+    my $data = {};
+    my $ptr;
+    my $x = XML::Parser->new(Handlers => {
+        Start => sub {
+            my ($x, $tag, @attr) = @_;
+            my $prev_ptr = $ptr;
+            if ($tag eq 'KeePassFile') {
+                croak "KeePassFile should only be used a the top level.\n" if $ptr;
+                $ptr = $data;
+            #} elsif ($tag eq 'Meta') {
+            #    croak "Not sure what to do with (@attr) on Meta." if @attr;
+            #    $ptr = $head->{'v2_meta'} ||= {};
+            } elsif (exists($prev_ptr->{$tag})
+                     || ($tag =~ /^(?:Binaries|Binary)$/ and $prev_ptr->{$tag} ||= []) ) {
+                $prev_ptr->{$tag} = [$prev_ptr->{$tag}] if 'ARRAY' ne ref $prev_ptr->{$tag};
+                push @{ $prev_ptr->{$tag} }, ($ptr = {});
+            } else {
+                $ptr = $prev_ptr->{$tag} ||= {};
+            }
+            $ptr->{'parent ptr'} = [$prev_ptr, $tag];
+        },
+        End   => sub {
+            my ($x, $tag) = @_;
+            if ($tag eq 'KeePassFile') {
+            #} elsif ($tag eq 'Meta') {
+            #    $ptr = undef;
+            }
+            my $cur_ptr = $ptr;
+            ($ptr, my $cur_tag) = @{ delete($ptr->{'parent ptr'}) };
+            if (exists $cur_ptr->{'content'}) {
+                if (1 == scalar keys %$cur_ptr) {
+                    if ('ARRAY' eq $ptr->{$cur_tag}) {
+                        $ptr->{$cur_tag}->[-1] = $cur_ptr->{'content'};
+                    } else {
+                        $ptr->{$cur_tag} = $cur_ptr->{'content'};
+                    }
+                } elsif (1 < scalar(keys %$cur_ptr) && $cur_ptr->{'content'} !~ /\S/) {
+                    delete $cur_ptr->{'content'};
+                }
+            }
+        },
+        Char  => sub {
+            my ($x, $data) = @_;
+            $ptr->{'content'} = $data;
+        },
+    });
+    $x->parse($buffer);
+    use CGI::Ex::Dump qw(debug);
+debug  $data;
+    exit;
 
-    $self->{'xml'} = $data if $self->{'keep_xml'};
+    #eval { require XML::Simple } or croak "Cannot load XML library to parse database: $@";
+    #my $data = XML::Simple::XMLin($buffer,
+    #                              ForceArray => [qw(Group Entry String Association Binaries Binary)],
+    #                              SuppressEmpty => '',
+    #                              );
+
+    $self->{'xml'} = $buffer if $self->{'keep_xml'};
 
     $head->{'v2_meta'} = $data->{'Meta'} || {};
+    print $buffer;
 
     # allow for arbitrary files stored as part of the zip
     my %BIN;
-    for my $bins (@{ delete($head->{'v2_meta'}->{'Binaries'}) || [] }) {
+    for my $bins (grep {$_} @{ delete($head->{'v2_meta'}->{'Binaries'}) || [] }) {
         for my $bin (@{ $bins->{'Binary'} || [] }) {
             my ($content, $id, $comp) = @$bin{qw(content ID Compressed)};
             $content = $self->decode_base64($content);
@@ -336,6 +391,15 @@ sub _parse_v2_body {
     }
 
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
+    my $salsa20 = $self->salsa20(sha256($head->{'protected_stream_key'}), $salsa20_iv, 20);
+    my $s20_buf = '';
+    my $s20_stream = sub {
+        my $enc = shift;
+        $s20_buf .= $salsa20->("\0" x 64) while length($s20_buf) < length($enc);
+        my $data = join '', map {chr(ord(substr $enc, $_, 1) ^ ord(substr $s20_buf, $_, 1))} 0 .. length($enc)-1;
+        substr $s20_buf, 0, length($enc), '';
+        return $data;
+    };
     my $rec; $rec = sub {
         my $node  = shift || return;
         my $level = shift || 0;
@@ -368,7 +432,15 @@ sub _parse_v2_body {
             $group->{'v2_raw'} = $ginfo if $self->{'keep_xml'};
             push @groups, $group;
             foreach my $einfo (@{ $ginfo->{'Entry'} || [] }) {
-                my %str = map {$_->{'Key'} => $_->{'Value'}} @{ $einfo->{'String'} || [] };
+                my %str;
+                for my $s (@{ $einfo->{'String'} || [] }) {
+                    my ($key, $val) = @$s{'Key', 'Value'};
+                    if (ref($val) eq 'HASH' && $val->{'Protected'} && $val->{'Protected'} eq 'True') {
+                        $val = $val->{'content'};
+                        $val = $s20_stream->($self->decode_base64($val)) if length $val;
+                    }
+                    $str{$key} = $val;
+                }
                 my $entry = {
                     accessed => $self->_parse_v2_date($einfo->{'Times'}->{'LastAccessTime'}),
                     created  => $self->_parse_v2_date($einfo->{'Times'}->{'CreationTime'}),
@@ -950,10 +1022,85 @@ sub locked_entry_password {
 
 ###----------------------------------------------------------------###
 
-sub decrypt_salsa20 {
-    my ($self, $enc, $key, $iv) = @_;
-}
+sub salsa20 {
+    my ($self, $key, $iv, $rounds) = @_;
 
+    my (@k, @c);
+    if (32 == length $key) {
+        @k = unpack 'L8', $key;
+        @c = (0x61707865, 0x3320646e, 0x79622d32, 0x6b206574); # SIGMA
+    } elsif (16 == length $key) {
+        @k = unpack 'L8', $key x 2;
+        @c = (0x61707865, 0x3120646e, 0x79622d36, 0x6b206574); # TAU
+    } else {
+        die "Salsa20 key length must be 16 or 32\n";
+    }
+
+    die "Salsa20 IV length must be 8\n" if length($iv) != 8;
+    my @v = unpack('L2', $iv);
+
+    $rounds ||= 12;
+    die "Salsa20 rounds must be 8, 12, or 20.\n" if !grep {$rounds != $_} 8, 12, 20;
+
+    #            0                                  5      6      7            10                                 # 15
+    my @state = ($c[0], $k[0], $k[1], $k[2], $k[3], $c[1], $v[0], $v[1], 0, 0, $c[2], $k[4], $k[5], $k[6], $k[7], $c[3]);
+
+    my $rotl32 = sub { return (($_[0] << $_[1]) | ($_[0] >> (32 - $_[1]))) & 0xffffffff };
+    my $word_to_byte = sub {
+        my @x = @state;
+        for (1 .. $rounds/2) {
+            $x[ 4] ^= $rotl32->( ($x[ 0]+$x[12]) & 0xffffffff,  7);
+            $x[ 8] ^= $rotl32->( ($x[ 4]+$x[ 0]) & 0xffffffff,  9);
+            $x[12] ^= $rotl32->( ($x[ 8]+$x[ 4]) & 0xffffffff, 13);
+            $x[ 0] ^= $rotl32->( ($x[12]+$x[ 8]) & 0xffffffff, 18);
+            $x[ 9] ^= $rotl32->( ($x[ 5]+$x[ 1]) & 0xffffffff,  7);
+            $x[13] ^= $rotl32->( ($x[ 9]+$x[ 5]) & 0xffffffff,  9);
+            $x[ 1] ^= $rotl32->( ($x[13]+$x[ 9]) & 0xffffffff, 13);
+            $x[ 5] ^= $rotl32->( ($x[ 1]+$x[13]) & 0xffffffff, 18);
+            $x[14] ^= $rotl32->( ($x[10]+$x[ 6]) & 0xffffffff,  7);
+            $x[ 2] ^= $rotl32->( ($x[14]+$x[10]) & 0xffffffff,  9);
+            $x[ 6] ^= $rotl32->( ($x[ 2]+$x[14]) & 0xffffffff, 13);
+            $x[10] ^= $rotl32->( ($x[ 6]+$x[ 2]) & 0xffffffff, 18);
+            $x[ 3] ^= $rotl32->( ($x[15]+$x[11]) & 0xffffffff,  7);
+            $x[ 7] ^= $rotl32->( ($x[ 3]+$x[15]) & 0xffffffff,  9);
+            $x[11] ^= $rotl32->( ($x[ 7]+$x[ 3]) & 0xffffffff, 13);
+            $x[15] ^= $rotl32->( ($x[11]+$x[ 7]) & 0xffffffff, 18);
+
+            $x[ 1] ^= $rotl32->( ($x[ 0]+$x[ 3]) & 0xffffffff,  7);
+            $x[ 2] ^= $rotl32->( ($x[ 1]+$x[ 0]) & 0xffffffff,  9);
+            $x[ 3] ^= $rotl32->( ($x[ 2]+$x[ 1]) & 0xffffffff, 13);
+            $x[ 0] ^= $rotl32->( ($x[ 3]+$x[ 2]) & 0xffffffff, 18);
+            $x[ 6] ^= $rotl32->( ($x[ 5]+$x[ 4]) & 0xffffffff,  7);
+            $x[ 7] ^= $rotl32->( ($x[ 6]+$x[ 5]) & 0xffffffff,  9);
+            $x[ 4] ^= $rotl32->( ($x[ 7]+$x[ 6]) & 0xffffffff, 13);
+            $x[ 5] ^= $rotl32->( ($x[ 4]+$x[ 7]) & 0xffffffff, 18);
+            $x[11] ^= $rotl32->( ($x[10]+$x[ 9]) & 0xffffffff,  7);
+            $x[ 8] ^= $rotl32->( ($x[11]+$x[10]) & 0xffffffff,  9);
+            $x[ 9] ^= $rotl32->( ($x[ 8]+$x[11]) & 0xffffffff, 13);
+            $x[10] ^= $rotl32->( ($x[ 9]+$x[ 8]) & 0xffffffff, 18);
+            $x[12] ^= $rotl32->( ($x[15]+$x[14]) & 0xffffffff,  7);
+            $x[13] ^= $rotl32->( ($x[12]+$x[15]) & 0xffffffff,  9);
+            $x[14] ^= $rotl32->( ($x[13]+$x[12]) & 0xffffffff, 13);
+            $x[15] ^= $rotl32->( ($x[14]+$x[13]) & 0xffffffff, 18);
+        }
+        return pack 'L16', map {($x[$_] + $state[$_]) & 0xffffffff} 0 .. 15;
+    };
+
+    return sub {
+        my $enc = shift;
+        my $out = '';
+
+        while ($enc) {
+            my $stream = $word_to_byte->();
+            $state[8] = ($state[8] + 1) & 0xffffffff;
+            $state[9] = ($state[9] + 1) & 0xffffffff if $state[8] == 0;
+            my $chunk = substr $enc, 0, 64, '';
+            $out .= join '', map {chr(ord(substr $stream, $_, 1) ^ ord(substr $chunk, $_, 1))} 0 .. length($chunk)-1;
+        }
+
+        return $out;
+    };
+}
 
 ###----------------------------------------------------------------###
 
