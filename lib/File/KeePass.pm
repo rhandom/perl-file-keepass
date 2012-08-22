@@ -42,6 +42,8 @@ sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
 
 sub header { shift->{'header'} || croak "No header loaded yet\n" }
 
+sub meta { shift->{'meta'} || croak "No meta information loaded yet\n" }
+
 ###----------------------------------------------------------------###
 
 sub load_db {
@@ -104,9 +106,10 @@ sub save_db {
 sub clear {
     my $self = shift;
     $self->unlock;
-    delete $self->{'groups'};
-    delete $self->{'header'};
+    delete @$self{qw(header meta groups)};
 }
+
+sub DESTROY { shift->clear }
 
 ###----------------------------------------------------------------###
 
@@ -122,13 +125,10 @@ sub parse_db {
 
     $self->{'header'} = $head;
 
-    if ($head->{'version'} == 1) {
-        $self->{'groups'} = $self->_parse_v1_body($buffer, $pass, $head);
-    } elsif ($head->{'version'} == 2) {
-        $self->{'groups'} = $self->_parse_v2_body($buffer, $pass, $head);
-    } else {
-        croak "Unsupported keepass database version ($head->{'version'})\n";
-    }
+    my $meth = ($head->{'version'} == 1) ? '_parse_v1_body'
+             : ($head->{'version'} == 2) ? '_parse_v2_body'
+             : croak "Unsupported keepass database version ($head->{'version'})\n";
+    @$self{qw(meta groups)} = $self->$meth($buffer, $pass, $head);
 
     $self->lock if $self->auto_lock;
     return $self;
@@ -137,19 +137,10 @@ sub parse_db {
 sub parse_header {
     my ($self, $buffer) = @_;
     my ($sig1, $sig2) = unpack 'LL', $buffer;
-
-    if ($sig1 != DB_SIG_1) {
-        croak "File signature (sig1) did not match ($sig1 != ".DB_SIG_1().")\n";
-    }
-    elsif ($sig2 eq DB_SIG_2_v1) {
-        return $self->_parse_v1_header($buffer);
-    }
-    elsif ($sig2 eq DB_SIG_2_v2) {
-        return $self->_parse_v2_header($buffer);
-    }
-    else {
-        die "Second file signature did not match ($sig2 != ".DB_SIG_2_v1()." or ".DB_SIG_2_v2().")\n";
-    }
+    croak "File signature (sig1) did not match ($sig1 != ".DB_SIG_1().")\n" if $sig1 != DB_SIG_1;
+    return $self->_parse_v1_header($buffer) if $sig2 eq DB_SIG_2_v1;
+    return $self->_parse_v2_header($buffer) if $sig2 eq DB_SIG_2_v2;
+    croak "Second file signature did not match ($sig2 != ".DB_SIG_2_v1()." or ".DB_SIG_2_v2().")\n";
 }
 
 sub _parse_v1_header {
@@ -161,7 +152,6 @@ sub _parse_v1_header {
     my %h = (version => 1, header_size => DB_HEADER_SIZE);
     @h{@f} = unpack $t, $buffer;
     croak "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
-
     $h{'enc_type'} = ($h{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
                    : ($h{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
                    : die "Unknown encryption type\n";
@@ -189,9 +179,8 @@ sub _parse_v2_header {
         if ($type == 1) {
             $h{'comment'} = $val;
         } elsif ($type == 2) {
-            warn "Cipher id did not match AES\n"
-                if $val ne join '', map {chr hex} ("31c1f2e6bf714350be5805216afc5aff" =~ /(..)/g);
-            $h{'cipher_id'} = $val;
+            warn "Cipher id did not match AES\n" if $val ne "\x31\xc1\xf2\xe6\xbf\x71\x43\x50\xbe\x58\x05\x21\x6a\xfc\x5a\xff";
+            $h{'cipher'} = 'aes';
         } elsif ($type == 3) {
             $val = unpack 'V', $val;
             warn "Compression was too large.\n" if $val > 1;
@@ -214,9 +203,8 @@ sub _parse_v2_header {
             warn "Length of start bytes was not 32\n" if length($val) != 32;
             $h{'start_bytes'} = $val;
         } elsif ($type == 10) {
-            $val = unpack 'V', $val;
-            warn "Inner stream id did not match Salsa20\n" if $val != 2;
-            $h{'inner_random_stream_id'} = $val;
+            warn "Inner stream id did not match Salsa20\n" if unpack('V', $val) != 2;
+            $h{'protected_stream'} = 'salsa20';
         } else {
             warn "Found an unknown header type ($type, $val)\n";
         }
@@ -265,7 +253,7 @@ sub _parse_v1_body {
 
     my ($groups, $gmap, $pos) = $self->_parse_v1_groups($buffer, $head->{'n_groups'});
     $self->_parse_v1_entries($buffer, $head->{'n_entries'}, $pos, $gmap, $groups);
-    return $groups;
+    return ({}, $groups);
 }
 
 sub _parse_v2_body {
@@ -284,14 +272,25 @@ sub _parse_v2_body {
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
     my $s20_stream = $self->salsa20_stream({key => sha256($head->{'protected_stream_key'}), iv => $salsa20_iv, rounds => 20});
     my %BIN;
-    my @groups;
+    my $META;
+    my @GROUPS;
     my $level = 0;
     my $data = $self->parse_xml($buffer, {
         top            => 'KeePassFile',
         force_array    => {map {$_ => 1} qw(Binaries Binary Group Entry String Association)},
         start_handlers => {Group => sub { $level++ }},
         end_handlers   => {
-            Meta => sub { delete $_[0]->{'Binaries'}; $head->{'v2_meta'} = delete($_[1]->{'Meta'}) },
+            Meta => sub {
+                my ($node, $parent) = @_;
+                croak "Found multiple intances of Meta.\n" if $META;
+                $META = {};
+                for my $key (keys %$node) {
+                    next if $key eq 'Binaries';
+                    (my $copy = $key) =~ s/([a-z])([A-Z])/${1}_${2}/g;
+                    $META->{lc $copy} = $copy =~ /_changed$/i ? $self->_parse_v2_date($node->{$key}) : $node->{$key};
+                }
+                $META->{'recycle_bin_enabled'} = $tri->($META->{'recycle_bin_enabled'});
+            },
             Binary => sub {
                 my ($node, $parent, $parent_tag, $tag) = @_;
                 if ($parent_tag eq 'Binaries') {
@@ -307,6 +306,12 @@ sub _parse_v2_body {
                     $key = do { warn "Missing key for binary."; 'unknown' } if ! defined $key;
                     warn "Duplicate binary key for entry." if $parent->{'__binary__'}->{$key};
                     $parent->{'__binary__'}->{$key} = $BIN{$node->{'Value'}->{'Ref'}};
+                }
+            },
+            MemoryProtection => sub {
+                my $node = shift;
+                for my $key (keys %$node) {
+                    $node->{lc $1} = delete($node->{$key}) eq 'True' ? 1 : 0 if $key =~ /^Protect(\w+)$/;
                 }
             },
             Group => sub {
@@ -340,7 +345,7 @@ sub _parse_v2_body {
                     push @{ $parent->{'__groups__'} }, $group;
                 } else {
                     $group->{'__parent_tag__'} = $parent_tag;
-                    push @groups, $group;
+                    push @GROUPS, $group;
                 }
             },
             Entry => sub {
@@ -391,7 +396,7 @@ sub _parse_v2_body {
         },
     });
 
-    return \@groups;
+    return ($META, \@GROUPS);
 }
 
 ###----------------------------------------------------------------###
@@ -1178,14 +1183,8 @@ attempts to iron out as many of the differences.
 
 =item new
 
-Returns a new File::KeePass object.  Any named arguments are added to self.
-
-=item auto_lock
-
-Default true.  If true, passwords are automatically hidden when a
-database loaded via parse_db or load_db.
-
-    $k->auto_lock(0); # turn off auto locking
+Takes a hashref or hash of arguments.  Returns a new File::KeePass
+object.  Any named arguments are added to self.
 
 =item load_db
 
@@ -1212,10 +1211,6 @@ $file.new.$epoch and are then renamed into the correct location.
 You will need to unlock the db via $k->unlock before calling this
 method if the database is currently locked.
 
-=item clear
-
-Clears any currently loaded groups database.
-
 =item parse_db
 
 Takes an string containting an encrypted kdb database, a master
@@ -1233,19 +1228,13 @@ $k->groups.
 
 =item parse_header
 
-Used by parse_db.
+Used by parse_db.  Reads just the header information.  Can be used as
+a basic KeePass file check.  The returned hash will contain version =>
+1 or version => 2 depending upon which type of header is found.  Can
+be called as a class method.
 
-=item _parse_v1_groups
-
-Used by parse_db.
-
-=item _parse_v1_entries
-
-Used by parse_db.
-
-=item _parse_v1_date
-
-Parses a kdb packed date.
+    my $head = File::KeePass->parse_header($kdb_buffer); # errors die
+    printf "This is a version %d database\n", $head->{'version'};
 
 =item gen_db
 
@@ -1258,13 +1247,39 @@ The headers can be passed in to test round trip portability.
 You will need to unlock the db via $k->unlock before calling this
 method if the database is currently locked.
 
-=item _gen_v1_header
+=item clear
 
-Returns a kdb file header.
+Clears any currently loaded database.
 
-=item _gen_v1_date
+=item auto_lock
 
-Returns a kdb packed date.
+Default true.  If true, passwords are automatically hidden when a
+database loaded via parse_db or load_db.
+
+    $k->auto_lock(0); # turn off auto locking
+
+=item is_locked
+
+Returns true if the current database is locked.
+
+=item lock
+
+Locks the database.  This moves all passwords into a protected, in
+memory, encrypted storage location.  Returns 1 on success.  Returns 2
+if the db is already locked.  If a database is loaded via parse_db or
+load_db and auto_lock is true, the newly loaded database will start
+out locked.
+
+=item unlock
+
+Unlocks a previously locked database.  You will need to unlock a
+database before calling save_db or gen_db.
+
+=back
+
+=head1 GROUP/ENTRY METHODS
+
+=over 4
 
 =item dump_groups
 
@@ -1278,9 +1293,10 @@ matching the criteria will be returned.
 
 =item groups
 
-Returns an arrayref of groups from the currently loaded database.  Groups returned
-will be hierarchal.  Note, groups simply returns a reference to all of the data.  It
-makes no attempts at cleaning up the data (find_groups will make sure the data is groomed).
+Returns an arrayref of groups from the currently loaded database.
+Groups returned will be hierarchal.  Note, groups simply returns a
+reference to all of the data.  It makes no attempts at cleaning up the
+data (find_groups will make sure the data is groomed).
 
     my $g = $k->groups;
 
@@ -1318,7 +1334,64 @@ Groups will look similar to the following:
 
 =item header
 
-Returns the current loaded db header.
+Returns the current loaded db header.  Some fields such as cipher,
+compression, protected_stream, protected_stream_key, and start_bytes
+only apply to version 2 databases.
+
+    header => {
+        cipher               => "aes",
+        compression          => 1,
+        enc_iv               => "123456789123456", # rand
+        enc_type             => "rijndael",
+        header_size          => 222,
+        protected_stream     => "salsa20",
+        protected_stream_key => "12345678901234567890123456789012", # rand
+        seed_key             => "12345678901234567890123456789012", # rand
+        seed_rand            => "12345678901234567890123456789012", # rand
+        seed_rot_n           => 6000,
+        sig1                 => "2594363651",
+        sig2                 => "3041655655",
+        start_bytes          => "12345678901234567890123456789012", # rand
+        ver                  => 196608,
+        version              => 2,
+    },
+
+=item meta
+
+Returns the current loaded db meta information.  Will be empty
+on a version 1 database.
+
+    meta => {
+        color                         => "#4FFF00",
+        custom_data                   => "",
+        database_description          => "database desc",
+        database_description_changed  => "2012-08-17 00:30:56",
+        database_name                 => "database name",
+        database_name_changed         => "2012-08-17 00:30:56",
+        default_user_name             => "",
+        default_user_name_changed     => "2012-08-17 00:30:34",
+        entry_templates_group         => "VL5nOpzlFUevGhqL71/OTA==",
+        entry_templates_group_changed => "2012-08-21 14:05:32",
+        generator                     => "KeePass",
+        history_max_items             => 10,
+        history_max_size              => 6291456, # bytes
+        last_selected_group           => "SUgL30QQqUK3tOWuNKUYJA==",
+        last_top_visible_group        => "dC1sQ1NO80W7klmRhfEUVw==",
+        maintenance_history_days      => 365,
+        master_key_change_force       => -1,
+        master_key_change_rec         => -1,
+        master_key_changed            => "2012-08-17 00:30:34",
+        memory_protection             => {
+            notes    => 0,
+            password => 1,
+            title    => 0,
+            url      => 0,
+            username => 0
+        },
+        recycle_bin_changed           => "2012-08-17 00:30:34",
+        recycle_bin_enabled           => 1,
+        recycle_bin_uuid              => "SUgL30QQqUK3tOWuNKUYJA=="
+    },
 
 =item add_group
 
@@ -1339,8 +1412,8 @@ that returned by find_group.
 
 =item finder_tests {
 
-Used by find_groups and find_entries.  Takes a hashref of arguments and returns a list
-of test code refs.
+Used by find_groups and find_entries.  Takes a hashref of arguments
+and returns a list of test code refs.
 
     {title => 'Foo'} # will check if title equals Foo
     {'title !' => 'Foo'} # will check if title does not equal Foo
@@ -1349,26 +1422,28 @@ of test code refs.
 
 =item find_groups
 
-Takes a hashref of search criteria and returns all matching groups.  Can be passed id,
-title, icon, and level.  Search arguments will be parsed by finder_tests.
+Takes a hashref of search criteria and returns all matching groups.
+Can be passed id, title, icon, and level.  Search arguments will be
+parsed by finder_tests.
 
     my @groups = $k->find_groups({title => 'Foo'});
 
     my @all_groups_flattened = $k->find_groups({});
 
-The find_groups method also checks to make sure group ids are unique and that all needed
-values are defined.
+The find_groups method also checks to make sure group ids are unique
+and that all needed values are defined.
 
 =item find_group
 
-Calls find_groups and returns the first group found.  Dies if multiple results are found.
-In scalar context it returns only the group.  In list context it returns the group, and its
-the arrayref in which it is stored (either the root level group or a sub groups group item).
+Calls find_groups and returns the first group found.  Dies if multiple
+results are found.  In scalar context it returns only the group.  In
+list context it returns the group, and its the arrayref in which it is
+stored (either the root level group or a sub groups group item).
 
 =item delete_group
 
-Passes arguments to find_group to find the group to delete.  Then deletes the group.  Returns
-the group that was just deleted.
+Passes arguments to find_group to find the group to delete.  Then
+deletes the group.  Returns the group that was just deleted.
 
 =item add_entry
 
@@ -1412,39 +1487,19 @@ will be parsed by finder_tests.
 
 =item find_entry
 
-Calls find_entries and returns the first entry found.  Dies if multiple results are found.
-In scalar context it returns only the entry.  In list context it returns the entry, and its
-group.
+Calls find_entries and returns the first entry found.  Dies if
+multiple results are found.  In scalar context it returns only the
+entry.  In list context it returns the entry, and its group.
 
 =item delete_entry
 
-Passes arguments to find_entry to find the entry to delete.  Then deletes the entry.  Returns
-the entry that was just deleted.
-
-=item now
-
-Returns the current localtime datetime stamp.
-
-=item is_locked
-
-Returns true if the current database is locked.
-
-=item lock
-
-Locks the database.  This moves all passwords into a protected, in memory, encrypted
-storage location.  Returns 1 on success.  Returns 2 if the db is already locked.  If
-a database is loaded vai parse_db or load_db and auto_lock is true, the newly loaded
-database will start out locked.
-
-=item unlock
-
-Unlocks a previously locked database.  You will need to unlock a database before
-calling save_db or gen_db.
+Passes arguments to find_entry to find the entry to delete.  Then
+deletes the entry.  Returns the entry that was just deleted.
 
 =item locked_entry_password
 
-Allows access to individual passwords for a database that is locked.  Dies if the database
-is not locked.
+Allows access to individual passwords for a database that is locked.
+Dies if the database is not locked.
 
 =back
 
@@ -1454,6 +1509,16 @@ The following methods are general purpose methods used during the
 parsing and generating of kdb databases.
 
 =over 4
+
+=item now
+
+Returns the current localtime datetime stamp.
+
+=item default_exp
+
+Returns the string representing the default expires time of an entry.
+Will use $self->{'default_exp'} or fails to the string '2999-12-31
+23:23:59'.
 
 =item decrypt_rijndael_cbc
 
@@ -1480,8 +1545,8 @@ Loads the Compress::Zlib library and unzips the contents.
 
 =item parse_xml
 
-Loads XML::Parser and sets up a basic parser that can call hooks at
-various events.  Without the hooks, it runs similarly to
+Loads the XML::Parser library and sets up a basic parser that can call
+hooks at various events.  Without the hooks, it runs similarly to
 XML::Simple::parse.
 
     my $data = $self->parse_xml($buffer, {
@@ -1522,6 +1587,53 @@ method maintains a buffer of xor bytes to ensure that none are wasted.
     my $encoder = $self->salsa20_stream({key => $key, iv => $Iv}); # no data
     my $encoded = $encoder->("1234");   # calls salsa20->()
     my $part2   = $encoder->("1234");   # uses the same pad until 64 bytes are used
+
+=back
+
+=head1 OTHER METHODS
+
+=over 4
+
+=item _parse_v1_header
+
+=item _parse_v1_body
+
+=item _parse_v1_groups
+
+=item _parse_v1_entries
+
+=item _parse_v1_date
+
+Utilities used for parsing version 1 type databases.
+
+=item _parse_v2_header
+
+=item _parse_v2_body
+
+=item _parse_v2_date
+
+Utilities used for parsing version 2 type databases.
+
+=item _gen_v1_header
+
+=item _gen_v1_db
+
+=item _gen_v1_date
+
+Utilities used to generate version 1 type databases.
+
+=item _gen_v2_header
+
+=item _gen_v2_db
+
+Utilities used to generate version 2 type databases.
+
+=item _master_v1_key
+
+=item _master_v2_key
+
+Takes the password and parsed headers.  Returns the
+master key based on database type.
 
 =back
 
