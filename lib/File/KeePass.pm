@@ -312,70 +312,29 @@ sub _parse_v2_body {
         croak "Unknown compression type.\n";
     }
 
-
-    eval { require XML::Parser } or croak "Cannot load XML library to parse database: $@";
-    my (@groups, @gstack);
-    my $top = 'KeePassFile';
-    my %force_array = map {$_ => 1} qw(Binaries Binary Group Entry String Association);
-    my $data;
-    my $ptr;
-    my $x = XML::Parser->new(Handlers => {
-        Start => sub {
-            my ($x, $tag, %attr) = @_; # loses multiple values of duplicately named attrs
-            my $prev_ptr = $ptr;
-            if ($tag eq $top) {
-                croak "The $top tag should only be used ta the top level.\n" if $ptr || $data;
-                $ptr = $data = {};
-            } elsif (exists($prev_ptr->{$tag})  || ($force_array{$tag} and $prev_ptr->{$tag} ||= [])) {
-                $prev_ptr->{$tag} = [$prev_ptr->{$tag}] if 'ARRAY' ne ref $prev_ptr->{$tag};
-                push @{ $prev_ptr->{$tag} }, ($ptr = {});
-            } else {
-                $ptr = $prev_ptr->{$tag} ||= {};
-            }
-            @$ptr{keys %attr} = values %attr;
-            $ptr->{'parent ptr'} = [$prev_ptr, $tag];
-        },
-        End => sub {
-            my ($x, $tag) = @_;
-            my $cur_ptr = $ptr;
-            ($ptr, my $cur_tag) = @{ delete($ptr->{'parent ptr'}) };
-            my $n_keys = scalar keys %$cur_ptr;
-            if (!$n_keys) {
-                $ptr->{$cur_tag} = ''; # SuppressEmpty
-            } elsif (exists $cur_ptr->{'content'}) {
-                if ($n_keys == 1) {
-                    if ('ARRAY' eq $ptr->{$cur_tag}) {
-                        $ptr->{$cur_tag}->[-1] = $cur_ptr->{'content'};
-                    } else {
-                        $ptr->{$cur_tag} = $cur_ptr->{'content'};
-                    }
-                } elsif ($cur_ptr->{'content'} !~ /\S/) {
-                    delete $cur_ptr->{'content'};
-                }
-            }
-        },
-        Char => sub { if (defined $ptr->{'content'}) { $ptr->{'content'} .= $_[1] } else { $ptr->{'content'} = $_[1] } },
-    });
-    $x->parse($buffer);
-
     $self->{'xml'} = $buffer if $self->{'keep_xml'};
 
-    $head->{'v2_meta'} = $data->{'Meta'} || {};
-    print $buffer;
-
-    # allow for arbitrary files stored as part of the zip
     my %BIN;
-    for my $bins (grep {$_} @{ delete($head->{'v2_meta'}->{'Binaries'}) || [] }) {
-        for my $bin (@{ $bins->{'Binary'} || [] }) {
-            my ($content, $id, $comp) = @$bin{qw(content ID Compressed)};
-            $content = $self->decode_base64($content);
-            if ($comp && $comp eq 'True') {
-                eval { $content = $self->decompress($content) } or warn "Could not decompress associated binary ($id): $@";
-            }
-            warn "Duplicate binary id $id - using most recent.\n" if exists $head->{'v2_meta'}->{'binaries'}->{$id};
-            $BIN{$id} = $content;
-        }
-    }
+    my $data = $self->parse_xml($buffer, {
+        top => 'KeePassFile',
+        force_array => {map {$_ => 1} qw(Binaries Binary Group Entry String Association)},
+        handlers => {
+            Binary => sub {
+                my ($node, $parent, $parent_tag, $tag) = @_;
+                return if $parent_tag ne 'Binaries';
+                my ($content, $id, $comp) = @$node{qw(content ID Compressed)};
+                $content = $self->decode_base64($content);
+                if ($comp && $comp eq 'True') {
+                    eval { $content = $self->decompress($content) } or warn "Could not decompress associated binary ($id): $@";
+                }
+                warn "Duplicate binary id $id - using most recent.\n" if exists $BIN{$id};
+                $BIN{$id} = $content;
+            },
+            Meta => sub { delete $_[0]->{'Binaries'} },
+        },
+    });
+
+    $head->{'v2_meta'} = delete($data->{'Meta'}) || {};
 
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
     my $salsa20 = $self->salsa20(sha256($head->{'protected_stream_key'}), $salsa20_iv, 20);
@@ -661,6 +620,58 @@ sub decode_base64 {
     my ($self, $content) = @_;
     eval { require MIME::Base64 } or croak "Cannot load Base64 library to decode item: $@";
     return MIME::Base64::decode_base64($content);
+}
+
+sub parse_xml {
+    my ($self, $buffer, $args) = @_;
+    eval { require XML::Parser } or croak "Cannot load XML library to parse database: $@";
+    my $top = $args->{'top'};
+    my $force_array = $args->{'force_array'} || {};
+    my $handlers    = $args->{'handlers'}    || {};
+    my $data;
+    my $ptr;
+    my $x = XML::Parser->new(Handlers => {
+        Start => sub {
+            my ($x, $tag, %attr) = @_; # loses multiple values of duplicately named attrs
+            my $prev_ptr = $ptr;
+            $top = $tag if !defined $top;
+            if ($tag eq $top) {
+                croak "The $top tag should only be used ta the top level.\n" if $ptr || $data;
+                $ptr = $data = {};
+            } elsif (exists($prev_ptr->{$tag})  || ($force_array->{$tag} and $prev_ptr->{$tag} ||= [])) {
+                $prev_ptr->{$tag} = [$prev_ptr->{$tag}] if 'ARRAY' ne ref $prev_ptr->{$tag};
+                push @{ $prev_ptr->{$tag} }, ($ptr = {});
+            } else {
+                $ptr = $prev_ptr->{$tag} ||= {};
+            }
+            @$ptr{keys %attr} = values %attr;
+            @$ptr{qw(__parent__ __tag__)} = ($prev_ptr, $tag);
+        },
+        End => sub {
+            my ($x, $tag) = @_;
+            my $cur_ptr = $ptr;
+            $ptr = delete $cur_ptr->{'__parent__'};
+            die "End tag mismatch on $tag.\n" if $tag ne delete($cur_ptr->{'__tag__'});
+            my $n_keys = scalar keys %$cur_ptr;
+            if (!$n_keys) {
+                $ptr->{$tag} = ''; # SuppressEmpty
+            } elsif (exists $cur_ptr->{'content'}) {
+                if ($n_keys == 1) {
+                    if ($ptr->{$tag} eq 'ARRAY') {
+                        $ptr->{$tag}->[-1] = $cur_ptr->{'content'};
+                    } else {
+                        $ptr->{$tag} = $cur_ptr->{'content'};
+                    }
+                } elsif ($cur_ptr->{'content'} !~ /\S/) {
+                    delete $cur_ptr->{'content'};
+                }
+            }
+            $handlers->{$tag}->($cur_ptr, $ptr, $ptr->{'__tag__'}, $tag) if $handlers->{$tag};
+        },
+        Char => sub { if (defined $ptr->{'content'}) { $ptr->{'content'} .= $_[1] } else { $ptr->{'content'} = $_[1] } },
+    });
+    $x->parse($buffer);
+    return $data;
 }
 
 ###----------------------------------------------------------------###
