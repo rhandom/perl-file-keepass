@@ -28,7 +28,8 @@ my $salsa20_iv = "\xe8\x30\x09\x4b\x97\x20\x5d\x2a";
 
 sub new {
     my $class = shift;
-    return bless {@_}, $class;
+    my $args  = ref($_[0]) ? {%{shift()}} : {@_};
+    return bless $args, $class;
 }
 
 sub auto_lock {
@@ -37,19 +38,24 @@ sub auto_lock {
     return !exists($self->{'auto_lock'}) || $self->{'auto_lock'};
 }
 
+sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
+
+sub header { shift->{'header'} || croak "No header loaded yet\n" }
+
 ###----------------------------------------------------------------###
 
 sub load_db {
     my $self = shift;
     my $file = shift || croak "Missing file\n";
     my $pass = shift || croak "Missing pass\n";
+    my $args = shift || {};
 
     open(my $fh, '<', $file) || croak "Couldn't open $file: $!\n";
     my $size = -s $file;
     read($fh, my $buffer, $size);
     close $fh;
     croak "Couldn't read entire file contents of $file.\n" if length($buffer) != $size;
-    return $self->parse_db($buffer, $pass);
+    return $self->parse_db($buffer, $pass, $args);
 }
 
 sub save_db {
@@ -105,8 +111,8 @@ sub clear {
 ###----------------------------------------------------------------###
 
 sub parse_db {
-    my ($self, $buffer, $pass) = @_;
-    $self = $self->new if ! ref $self;
+    my ($self, $buffer, $pass, $args) = @_;
+    $self = $self->new($args || {}) if ! ref $self;
 
     # parse and verify headers
     my $head = $self->parse_header($buffer);
@@ -306,25 +312,17 @@ sub _parse_v2_body {
 
     # allow for protected string values
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
-    my $salsa20 = $self->salsa20(sha256($head->{'protected_stream_key'}), $salsa20_iv, 20);
-    my $s20_buf = '';
-    my $s20_stream = sub {
-        my $enc = shift;
-        $s20_buf .= $salsa20->("\0" x 64) while length($s20_buf) < length($enc);
-        my $data = join '', map {chr(ord(substr $enc, $_, 1) ^ ord(substr $s20_buf, $_, 1))} 0 .. length($enc)-1;
-        substr $s20_buf, 0, length($enc), '';
-        return $data;
-    };
+    my $s20_stream = $self->salsa20_stream({key => sha256($head->{'protected_stream_key'}), iv => $salsa20_iv, rounds => 20});
 
     # parse the XML - use our own parser since XML::Simple does not do event based actions
     my %BIN;
     my @groups;
     my $level = 0;
     my $data = $self->parse_xml($buffer, {
-        top => 'KeePassFile',
-        force_array => {map {$_ => 1} qw(Binaries Binary Group Entry String Association)},
+        top            => 'KeePassFile',
+        force_array    => {map {$_ => 1} qw(Binaries Binary Group Entry String Association)},
         start_handlers => {Group => sub { $level++ }},
-        end_handlers => {
+        end_handlers   => {
             Meta => sub { delete $_[0]->{'Binaries'}; $head->{'v2_meta'} = delete($_[1]->{'Meta'}) },
             Binary => sub {
                 my ($node, $parent, $parent_tag, $tag) = @_;
@@ -694,7 +692,7 @@ sub gen_db {
     $head->{'sig1'}       = DB_SIG_1();
     $head->{'sig2'}       = DB_SIG_2_v1();
 
-    if (($head->{'version'} || $self->{'version'} || '') == 2) {
+    if (($head->{'version'} || $self->{'version'} || '') eq '2') {
         return $self->_gen_v2_db($pass, $groups, $head);
     } else {
         return $self->_gen_v1_db($pass, $groups, $head);
@@ -737,8 +735,7 @@ sub _gen_v1_db {
         $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         foreach my $e (@{ $g->{'entries'} || [] }) {
             $head->{'n_entries'}++;
-            my @d = (
-                     [1,      pack('LH*', length($e->{'id'})/2, $e->{'id'})],
+            my @d = ([1,      pack('LH*', length($e->{'id'})/2, $e->{'id'})],
                      [2,      pack('LL', 4, $g->{'id'}   || 0)],
                      [3,      pack('LL', 4, $e->{'icon'} || 0)],
                      [4,      pack('L', length($e->{'title'})+1)."$e->{'title'}\0"],
@@ -763,10 +760,10 @@ sub _gen_v1_db {
     $head->{'flags'} = DB_FLAG_RIJNDAEL();
     $head->{'ver'}   = DB_VER_DW();
 
-    return $self->gen_header($head) . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
+    return $self->_gen_v1_header($head) . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 }
 
-sub gen_header {
+sub _gen_v1_header {
     my ($self, $args) = @_;
     local $args->{'n_groups'}  = $args->{'n_groups'}  || 0;
     local $args->{'n_entries'} = $args->{'n_entries'} || 0;
@@ -809,10 +806,6 @@ sub dump_groups {
     }
     return $t;
 }
-
-sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
-
-sub header { shift->{'header'} || croak "No header loaded yet\n" }
 
 sub add_group {
     my ($self, $args, $top_groups) = @_;
@@ -1020,8 +1013,25 @@ sub locked_entry_password {
 
 ###----------------------------------------------------------------###
 
-sub salsa20 {
-    my ($self, $key, $iv, $rounds) = @_;
+sub salsa20_stream {
+    my ($self, $args) = @_;
+    delete $args->{'data'};
+    my $salsa20 = $self->salsa20($args);
+    my $buffer = '';
+    return sub {
+        my $enc = shift;
+        $buffer .= $salsa20->("\0" x 64) while length($buffer) < length($enc);
+        my $data = join '', map {chr(ord(substr $enc, $_, 1) ^ ord(substr $buffer, $_, 1))} 0 .. length($enc)-1;
+        substr $buffer, 0, length($enc), '';
+        return $data;
+    };
+}
+
+
+sub salsa20 { # http://cr.yp.to/snuffle/salsa20/regs/salsa20.c
+    my ($self, $args) = @_;
+    my ($key, $iv, $rounds) = @$args{qw(key iv rounds)};
+    $rounds ||= 20;
 
     my (@k, @c);
     if (32 == length $key) {
@@ -1033,12 +1043,9 @@ sub salsa20 {
     } else {
         die "Salsa20 key length must be 16 or 32\n";
     }
-
     die "Salsa20 IV length must be 8\n" if length($iv) != 8;
-    my @v = unpack('L2', $iv);
-
-    $rounds ||= 12;
     die "Salsa20 rounds must be 8, 12, or 20.\n" if !grep {$rounds != $_} 8, 12, 20;
+    my @v = unpack('L2', $iv);
 
     #            0                                  5      6      7            10                                 # 15
     my @state = ($c[0], $k[0], $k[1], $k[2], $k[3], $c[1], $v[0], $v[1], 0, 0, $c[2], $k[4], $k[5], $k[6], $k[7], $c[3]);
@@ -1047,57 +1054,57 @@ sub salsa20 {
     my $word_to_byte = sub {
         my @x = @state;
         for (1 .. $rounds/2) {
-            $x[ 4] ^= $rotl32->( ($x[ 0]+$x[12]) & 0xffffffff,  7);
-            $x[ 8] ^= $rotl32->( ($x[ 4]+$x[ 0]) & 0xffffffff,  9);
-            $x[12] ^= $rotl32->( ($x[ 8]+$x[ 4]) & 0xffffffff, 13);
-            $x[ 0] ^= $rotl32->( ($x[12]+$x[ 8]) & 0xffffffff, 18);
-            $x[ 9] ^= $rotl32->( ($x[ 5]+$x[ 1]) & 0xffffffff,  7);
-            $x[13] ^= $rotl32->( ($x[ 9]+$x[ 5]) & 0xffffffff,  9);
-            $x[ 1] ^= $rotl32->( ($x[13]+$x[ 9]) & 0xffffffff, 13);
-            $x[ 5] ^= $rotl32->( ($x[ 1]+$x[13]) & 0xffffffff, 18);
-            $x[14] ^= $rotl32->( ($x[10]+$x[ 6]) & 0xffffffff,  7);
-            $x[ 2] ^= $rotl32->( ($x[14]+$x[10]) & 0xffffffff,  9);
-            $x[ 6] ^= $rotl32->( ($x[ 2]+$x[14]) & 0xffffffff, 13);
-            $x[10] ^= $rotl32->( ($x[ 6]+$x[ 2]) & 0xffffffff, 18);
-            $x[ 3] ^= $rotl32->( ($x[15]+$x[11]) & 0xffffffff,  7);
-            $x[ 7] ^= $rotl32->( ($x[ 3]+$x[15]) & 0xffffffff,  9);
-            $x[11] ^= $rotl32->( ($x[ 7]+$x[ 3]) & 0xffffffff, 13);
-            $x[15] ^= $rotl32->( ($x[11]+$x[ 7]) & 0xffffffff, 18);
+            $x[ 4] ^= $rotl32->(($x[ 0] + $x[12]) & 0xffffffff,  7);
+            $x[ 8] ^= $rotl32->(($x[ 4] + $x[ 0]) & 0xffffffff,  9);
+            $x[12] ^= $rotl32->(($x[ 8] + $x[ 4]) & 0xffffffff, 13);
+            $x[ 0] ^= $rotl32->(($x[12] + $x[ 8]) & 0xffffffff, 18);
+            $x[ 9] ^= $rotl32->(($x[ 5] + $x[ 1]) & 0xffffffff,  7);
+            $x[13] ^= $rotl32->(($x[ 9] + $x[ 5]) & 0xffffffff,  9);
+            $x[ 1] ^= $rotl32->(($x[13] + $x[ 9]) & 0xffffffff, 13);
+            $x[ 5] ^= $rotl32->(($x[ 1] + $x[13]) & 0xffffffff, 18);
+            $x[14] ^= $rotl32->(($x[10] + $x[ 6]) & 0xffffffff,  7);
+            $x[ 2] ^= $rotl32->(($x[14] + $x[10]) & 0xffffffff,  9);
+            $x[ 6] ^= $rotl32->(($x[ 2] + $x[14]) & 0xffffffff, 13);
+            $x[10] ^= $rotl32->(($x[ 6] + $x[ 2]) & 0xffffffff, 18);
+            $x[ 3] ^= $rotl32->(($x[15] + $x[11]) & 0xffffffff,  7);
+            $x[ 7] ^= $rotl32->(($x[ 3] + $x[15]) & 0xffffffff,  9);
+            $x[11] ^= $rotl32->(($x[ 7] + $x[ 3]) & 0xffffffff, 13);
+            $x[15] ^= $rotl32->(($x[11] + $x[ 7]) & 0xffffffff, 18);
 
-            $x[ 1] ^= $rotl32->( ($x[ 0]+$x[ 3]) & 0xffffffff,  7);
-            $x[ 2] ^= $rotl32->( ($x[ 1]+$x[ 0]) & 0xffffffff,  9);
-            $x[ 3] ^= $rotl32->( ($x[ 2]+$x[ 1]) & 0xffffffff, 13);
-            $x[ 0] ^= $rotl32->( ($x[ 3]+$x[ 2]) & 0xffffffff, 18);
-            $x[ 6] ^= $rotl32->( ($x[ 5]+$x[ 4]) & 0xffffffff,  7);
-            $x[ 7] ^= $rotl32->( ($x[ 6]+$x[ 5]) & 0xffffffff,  9);
-            $x[ 4] ^= $rotl32->( ($x[ 7]+$x[ 6]) & 0xffffffff, 13);
-            $x[ 5] ^= $rotl32->( ($x[ 4]+$x[ 7]) & 0xffffffff, 18);
-            $x[11] ^= $rotl32->( ($x[10]+$x[ 9]) & 0xffffffff,  7);
-            $x[ 8] ^= $rotl32->( ($x[11]+$x[10]) & 0xffffffff,  9);
-            $x[ 9] ^= $rotl32->( ($x[ 8]+$x[11]) & 0xffffffff, 13);
-            $x[10] ^= $rotl32->( ($x[ 9]+$x[ 8]) & 0xffffffff, 18);
-            $x[12] ^= $rotl32->( ($x[15]+$x[14]) & 0xffffffff,  7);
-            $x[13] ^= $rotl32->( ($x[12]+$x[15]) & 0xffffffff,  9);
-            $x[14] ^= $rotl32->( ($x[13]+$x[12]) & 0xffffffff, 13);
-            $x[15] ^= $rotl32->( ($x[14]+$x[13]) & 0xffffffff, 18);
+            $x[ 1] ^= $rotl32->(($x[ 0] + $x[ 3]) & 0xffffffff,  7);
+            $x[ 2] ^= $rotl32->(($x[ 1] + $x[ 0]) & 0xffffffff,  9);
+            $x[ 3] ^= $rotl32->(($x[ 2] + $x[ 1]) & 0xffffffff, 13);
+            $x[ 0] ^= $rotl32->(($x[ 3] + $x[ 2]) & 0xffffffff, 18);
+            $x[ 6] ^= $rotl32->(($x[ 5] + $x[ 4]) & 0xffffffff,  7);
+            $x[ 7] ^= $rotl32->(($x[ 6] + $x[ 5]) & 0xffffffff,  9);
+            $x[ 4] ^= $rotl32->(($x[ 7] + $x[ 6]) & 0xffffffff, 13);
+            $x[ 5] ^= $rotl32->(($x[ 4] + $x[ 7]) & 0xffffffff, 18);
+            $x[11] ^= $rotl32->(($x[10] + $x[ 9]) & 0xffffffff,  7);
+            $x[ 8] ^= $rotl32->(($x[11] + $x[10]) & 0xffffffff,  9);
+            $x[ 9] ^= $rotl32->(($x[ 8] + $x[11]) & 0xffffffff, 13);
+            $x[10] ^= $rotl32->(($x[ 9] + $x[ 8]) & 0xffffffff, 18);
+            $x[12] ^= $rotl32->(($x[15] + $x[14]) & 0xffffffff,  7);
+            $x[13] ^= $rotl32->(($x[12] + $x[15]) & 0xffffffff,  9);
+            $x[14] ^= $rotl32->(($x[13] + $x[12]) & 0xffffffff, 13);
+            $x[15] ^= $rotl32->(($x[14] + $x[13]) & 0xffffffff, 18);
         }
         return pack 'L16', map {($x[$_] + $state[$_]) & 0xffffffff} 0 .. 15;
     };
 
-    return sub {
+    my $encoder = sub {
         my $enc = shift;
         my $out = '';
-
-        while ($enc) {
+        while (length $enc) {
             my $stream = $word_to_byte->();
             $state[8] = ($state[8] + 1) & 0xffffffff;
             $state[9] = ($state[9] + 1) & 0xffffffff if $state[8] == 0;
             my $chunk = substr $enc, 0, 64, '';
             $out .= join '', map {chr(ord(substr $stream, $_, 1) ^ ord(substr $chunk, $_, 1))} 0 .. length($chunk)-1;
         }
-
         return $out;
     };
+    return $encoder if !exists $args->{'data'};
+    return $encoder->(defined($args->{'data'}) ? $args->{'data'} : '');
 }
 
 ###----------------------------------------------------------------###
@@ -1113,8 +1120,8 @@ __END__
 
     my $k = File::KeePass->new;
 
+    # read a version 1 or version 2 database
     $k->load_db($file, $master_pass); # errors die
-
 
     use Data::Dumper qw(Dumper);
     print Dumper $k->groups; # passwords are locked
@@ -1163,7 +1170,21 @@ __END__
     print $e->{'password'}; # eq 'somepass'
 
 
+    # save out a version 1 database
     $k->save_db("/some/file/location.kdb", $master_pass);
+
+    # save out a version 2 database
+    $k->save_db("/some/file/location.kdbx", $master_pass);
+
+=head1 DESCRIPTION
+
+File::KeePass gives access to KeePass version 1 (kdb) and
+version 2 (kdbx) databases.
+
+
+The version 1 and version 2 databases are very different in
+construction, but the majority of information overlaps.  File::KeePass
+attempts to iron out as many of the differences.
 
 =head1 METHODS
 
@@ -1175,24 +1196,35 @@ Returns a new File::KeePass object.  Any named arguments are added to self.
 
 =item auto_lock
 
-Default true.  If true, passwords are automatically hidden when a database loaded
-via parse_db or load_db.
+Default true.  If true, passwords are automatically hidden when a
+database loaded via parse_db or load_db.
 
     $k->auto_lock(0); # turn off auto locking
 
 =item load_db
 
-Takes a kdb filename and a master password.  Returns true on success.  Errors die.
-The resulting database can be accessed via various methods including $k->groups.
+Takes a kdb filename, a master password, and an optional argument
+hashref.  Returns the File::KeePass object on success (can be called
+as a class method).  Errors die.  The resulting database can be
+accessed via various methods including $k->groups.
+
+    my $k = File::KeePass->new;
+    $k->load_db($file, $pwd);
+
+    my $k = File::KeePass->load_db($file, $pwd);
+
+    my $k = File::KeePass->load_db($file, $pwd, {auto_lock => 0});
+
+The contents are read from file and passed to parse_db.
 
 =item save_db
 
-Takes a kdb filename and a master password.  Stores out the current groups in the object.
-Writes attempt to write first to $file.new.$epoch and are then renamed into the correct
-location.
+Takes a kdb filename and a master password.  Stores out the current
+groups in the object.  Writes attempt to write first to
+$file.new.$epoch and are then renamed into the correct location.
 
-You will need to unlock the db via $k->unlock before calling this method if the database
-is currently locked.
+You will need to unlock the db via $k->unlock before calling this
+method if the database is currently locked.
 
 =item clear
 
@@ -1200,8 +1232,18 @@ Clears any currently loaded groups database.
 
 =item parse_db
 
-Takes an encrypted kdb database and a master password.  Returns true on success.  Errors die.
-The resulting database can be accessed via various methods including $k->groups.
+Takes an string containting an encrypted kdb database, a master
+password, and an optional argument hashref.  Returns the File::KeePass
+object on success (can be called as a class method).  Errors die.  The
+resulting database can be accessed via various methods including
+$k->groups.
+
+    my $k = File::KeePass->new;
+    $k->parse_db($loaded_kdb, $pwd);
+
+    my $k = File::KeePass->parse_db($kdb_buffer, $pwd);
+
+    my $k = File::KeePass->parse_db($kdb_buffer, $pwd, {auto_lock => 0});
 
 =item parse_header
 
@@ -1219,25 +1261,18 @@ Used by parse_db.
 
 Parses a kdb packed date.
 
-=item decrypt_rijndael_cbc
-
-Takes an encrypted string, a key, and an encryption_iv string.  Returns a plaintext string.
-
-=item encrypt_rijndael_cbc
-
-Takes a plaintext string, a key, and an encryption_iv string.  Returns an encrypted string.
-
 =item gen_db
 
-Takes a master password.  Optionally takes a "groups" arrayref and a "headers" hashref.
-If groups are not passed, it defaults to using the currently loaded groups.  If headers are
-not passed, a fresh set of headers are generated based on the groups and the master password.
+Takes a master password.  Optionally takes a "groups" arrayref and a
+"headers" hashref.  If groups are not passed, it defaults to using the
+currently loaded groups.  If headers are not passed, a fresh set of
+headers are generated based on the groups and the master password.
 The headers can be passed in to test round trip portability.
 
-You will need to unlock the db via $k->unlock before calling this method if the database
-is currently locked.
+You will need to unlock the db via $k->unlock before calling this
+method if the database is currently locked.
 
-=item gen_header
+=item _gen_v1_header
 
 Returns a kdb file header.
 
@@ -1247,12 +1282,13 @@ Returns a kdb packed date.
 
 =item dump_groups
 
-Returns a simplified string representation of the currently loaded database.
+Returns a simplified string representation of the currently loaded
+database.
 
     print $k->dump_groups;
 
-You can optionally pass a match argument hashref.  Only entries matching the
-criteria will be returned.
+You can optionally pass a match argument hashref.  Only entries
+matching the criteria will be returned.
 
 =item groups
 
@@ -1426,34 +1462,115 @@ is not locked.
 
 =back
 
+=head1 UTILITY METHODS
+
+The following methods are general purpose methods used during the
+parsing and generating of kdb databases.
+
+=over 4
+
+=item decrypt_rijndael_cbc
+
+Takes an encrypted string, a key, and an encryption_iv string.
+Returns a plaintext string.
+
+=item encrypt_rijndael_cbc
+
+Takes a plaintext string, a key, and an encryption_iv string.  Returns
+an encrypted string.
+
+=item decode_base64
+
+Loads the MIME::Base64 library and decodes the passed string.
+
+=item decompress
+
+Loads the Compress::Zlib library and unzips the contents.
+
+=item parse_xml
+
+Loads XML::Parser and sets up a basic parser that can call hooks at
+various events.  Without the hooks, it runs similarly to
+XML::Simple::parse.
+
+    my $data = $self->parse_xml($buffer, {
+        top            => 'KeePassFile',
+        force_array    => {Group => 1, Entry => 1},
+        start_handlers => {Group => sub { $level++ }},
+        end_handlers   => {Group => sub { $level-- }},
+    });
+
+=item salsa20
+
+Takes a hashref containing a salsa20 key string (length 32 or 16), a
+salsa20 iv string (length 8), number of salsa20 rounds (8, 12, or 20 -
+default 20), and an optional data string.  The key and iv are used to
+initialize the salsa20 encryption.
+
+If a data string is passed, the string is salsa20 encrypted and
+returned.
+
+If no data string is passed a salsa20 encrypting coderef is returned.
+
+    my $encoded = $self->salsa20({key => $key, iv => $iv, data => $data});
+    my $uncoded = $self->salsa20({key => $key, iv => $iv, data => $encoded});
+    # $data eq $uncoded
+
+    my $encoder = $self->salsa20({key => $key, iv => $Iv}); # no data
+    my $encoded = $encoder->($data);
+    my $part2   = $encoder->($more_data); # continues from previous state
+
+=item salsa20_stream
+
+Takes a hashref that will be passed to salsa20.  Uses the resulting
+encoder to generate a more continuous encoded stream.  The salsa20
+method encodes in chunks of 64 bytes.  If a string is not a multiple
+of 64, then some of the xor bytes are unused.  The salsa20_stream
+method maintains a buffer of xor bytes to ensure that none are wasted.
+
+    my $encoder = $self->salsa20_stream({key => $key, iv => $Iv}); # no data
+    my $encoded = $encoder->("1234");   # calls salsa20->()
+    my $part2   = $encoder->("1234");   # uses the same pad until 64 bytes are used
+
+=back
+
 =head1 BUGS
 
 Only Rijndael is supported.
 
 Only passkeys are supported (no key files).
 
-This module makes no attempt to act as a password agent.  That is the job of File::KeePass::Agent.
-This isn't really a bug but some people will think it is.
+This module makes no attempt to act as a password agent.  That is the
+job of File::KeePass::Agent.  This isn't really a bug but some people
+will think it is.
 
-Groups and entries don't have true objects associated with them.  At the moment this is by design.
-The data is kept as plain boring data.
+Groups and entries don't have true objects associated with them.  At
+the moment this is by design.  The data is kept as plain boring data.
 
 =head1 SOURCES
 
-Knowledge about the KeePass DB v1 format was gleaned from the source code of keepassx-0.4.3.  That
-source code is published under the GPL2 license.  KeePassX 0.4.3 bears the copyright of
+Knowledge about the KeePass DB v1 format was gleaned from the source
+code of keepassx-0.4.3.  That source code is published under the GPL2
+license.  KeePassX 0.4.3 bears the copyright of
 
     Copyright (C) 2005-2008 Tarek Saidi <tarek.saidi@arcor.de>
     Copyright (C) 2007-2009 Felix Geyer <debfx-keepassx {at} fobos.de>
 
-Knowledge about the KeePass DB v2 format was gleaned from the source code of keepassx-2.0-alpha1.  That
-source code is published under the GPL2 or GPL3 license.  KeePassX 2.0-alpha1 bears the copyright of
+Knowledge about the KeePass DB v2 format was gleaned from the source
+code of keepassx-2.0-alpha1.  That source code is published under the
+GPL2 or GPL3 license.  KeePassX 2.0-alpha1 bears the copyright of
 
     Copyright: 2010-2012, Felix Geyer <debfx@fobos.de>
                2011-2012, Florian Geyer <blueice@fobos.de>
 
-The encryption/decryption algorithms of File::KeePass are of derivative nature from KeePassX and could
-not have been created without this insight - though the perl code is from scratch.
+The salsa20 algorithm is based on
+http://cr.yp.to/snuffle/salsa20/regs/salsa20.c which is listed as
+Public domain (D. J. Bernstein).
+
+The ordering and layering of encryption/decryption algorithms of
+File::KeePass are of derivative nature from KeePassX and could not
+have been created without this insight - though the perl code is from
+scratch.
 
 =head1 AUTHOR
 
