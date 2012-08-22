@@ -252,21 +252,17 @@ sub _master_v2_key {
 sub _parse_v1_body {
     my ($self, $buffer, $pass, $head) = @_;
 
-    my $key = $self->_master_v1_key($pass, $head);
+    croak "Unimplemented enc_type $head->{'enc_type'}\n"
+        if $head->{'enc_type'} ne 'rijndael';
 
-    # decrypt the buffer
-    if ($head->{'enc_type'} eq 'rijndael') {
-        $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
-    } else {
-        die "Unimplemented enc_type $head->{'enc_type'}";
-    }
+    my $key = $self->_master_v1_key($pass, $head);
+    $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 
     croak "The file could not be decrypted either because the key is wrong or the file is damaged.\n"
         if length($buffer) > 2**31 || (!length($buffer) && $head->{'n_groups'});
     croak "The file checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)\n"
         if $head->{'checksum'} ne sha256($buffer);
 
-    # read the db
     my ($groups, $gmap, $pos) = $self->_parse_v1_groups($buffer, $head->{'n_groups'});
     $self->_parse_v1_entries($buffer, $head->{'n_entries'}, $pos, $gmap, $groups);
     return $groups;
@@ -276,45 +272,17 @@ sub _parse_v2_body {
     my ($self, $buffer, $pass, $head) = @_;
 
     my $key = $self->_master_v2_key($pass, $head);
-
     $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
+    croak "The database key appears invalid or else the database is corrupt.\n"
+        if substr($buffer, 0, 32, '') ne $head->{'start_bytes'};
 
-    my $start = substr($buffer, 0, 32, '');
-    if ($start ne $head->{'start_bytes'}) {
-        croak "The database key appears invalid or else the database is corrupt.\n";
-    }
-
-    # Hash block chunking
-    my $new = '';
-    my $pos = 0;
-    while ($pos < length($buffer)) {
-        my ($index, $hash, $size) = unpack "\@$pos L a32 i", $buffer;
-        $pos += 40;
-        if ($size == 0) {
-            warn "Found mismatch for 0 chunksize\n" if $hash !~ /^\x00{32}$/;
-            last;
-        }
-
-        my $chunk = substr $buffer, $pos, $size;
-        croak "Chunk hash of index $index did not match\n" if $hash ne sha256($chunk);
-        $pos += $size;
-        $new .= $chunk;
-    }
-    $buffer = $new;
-    $new = '';
-
-    if ($head->{'compression'} == 1) {
-        $buffer = $self->decompress($buffer);
-    } elsif (!defined($head->{'compression'}) || $head->{'compression'} != 0) {
-        croak "Unknown compression type.\n";
-    }
+    $buffer = $self->unchunksum($buffer);
+    $buffer = $self->decompress($buffer) if ($head->{'compression'} || '') eq '1';
     $self->{'xml'} = $buffer if $self->{'keep_xml'};
 
-    # allow for protected string values
+    # parse the XML - use our own parser since XML::Simple does not do event based actions
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
     my $s20_stream = $self->salsa20_stream({key => sha256($head->{'protected_stream_key'}), iv => $salsa20_iv, rounds => 20});
-
-    # parse the XML - use our own parser since XML::Simple does not do event based actions
     my %BIN;
     my @groups;
     my $level = 0;
@@ -602,6 +570,24 @@ sub encrypt_rijndael_cbc {
     return $cipher->encrypt($buffer);
 }
 
+sub unchunksum {
+    my ($self, $buffer) = @_;
+    my ($new, $pos) = ('', 0);
+    while ($pos < length($buffer)) {
+        my ($index, $hash, $size) = unpack "\@$pos L a32 i", $buffer;
+        $pos += 40;
+        if ($size == 0) {
+            warn "Found mismatch for 0 chunksize\n" if $hash !~ /^\x00{32}$/;
+            last;
+        }
+        my $chunk = substr $buffer, $pos, $size;
+        croak "Chunk hash of index $index did not match\n" if $hash ne sha256($chunk);
+        $pos += $size;
+        $new .= $chunk;
+    }
+    return $new;
+}
+
 sub decompress {
     my ($self, $buffer) = @_;
     eval { require Compress::Zlib } or croak "Cannot load compression library to decompress database: $@";
@@ -633,7 +619,7 @@ sub parse_xml {
             my $prev_ptr = $ptr;
             $top = $tag if !defined $top;
             if ($tag eq $top) {
-                croak "The $top tag should only be used ta the top level.\n" if $ptr || $data;
+                croak "The $top tag should only be used at the top level.\n" if $ptr || $data;
                 $ptr = $data = {};
             } elsif (exists($prev_ptr->{$tag})  || ($force_array->{$tag} and $prev_ptr->{$tag} ||= [])) {
                 $prev_ptr->{$tag} = [$prev_ptr->{$tag}] if 'ARRAY' ne ref $prev_ptr->{$tag};
@@ -1482,6 +1468,11 @@ an encrypted string.
 =item decode_base64
 
 Loads the MIME::Base64 library and decodes the passed string.
+
+=item unchunksum
+
+Parses and reassembles a buffer, reading in lengths, and checksums
+of chunks.
 
 =item decompress
 
