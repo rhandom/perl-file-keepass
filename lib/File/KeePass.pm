@@ -312,64 +312,51 @@ sub _parse_v2_body {
         croak "Unknown compression type.\n";
     }
 
+
     eval { require XML::Parser } or croak "Cannot load XML library to parse database: $@";
     my (@groups, @gstack);
-    my $data = {};
+    my $top = 'KeePassFile';
+    my %force_array = map {$_ => 1} qw(Binaries Binary Group Entry String Association);
+    my $data;
     my $ptr;
     my $x = XML::Parser->new(Handlers => {
         Start => sub {
-            my ($x, $tag, @attr) = @_;
+            my ($x, $tag, %attr) = @_; # loses multiple values of duplicately named attrs
             my $prev_ptr = $ptr;
-            if ($tag eq 'KeePassFile') {
-                croak "KeePassFile should only be used a the top level.\n" if $ptr;
-                $ptr = $data;
-            #} elsif ($tag eq 'Meta') {
-            #    croak "Not sure what to do with (@attr) on Meta." if @attr;
-            #    $ptr = $head->{'v2_meta'} ||= {};
-            } elsif (exists($prev_ptr->{$tag})
-                     || ($tag =~ /^(?:Binaries|Binary)$/ and $prev_ptr->{$tag} ||= []) ) {
+            if ($tag eq $top) {
+                croak "The $top tag should only be used ta the top level.\n" if $ptr || $data;
+                $ptr = $data = {};
+            } elsif (exists($prev_ptr->{$tag})  || ($force_array{$tag} and $prev_ptr->{$tag} ||= [])) {
                 $prev_ptr->{$tag} = [$prev_ptr->{$tag}] if 'ARRAY' ne ref $prev_ptr->{$tag};
                 push @{ $prev_ptr->{$tag} }, ($ptr = {});
             } else {
                 $ptr = $prev_ptr->{$tag} ||= {};
             }
+            @$ptr{keys %attr} = values %attr;
             $ptr->{'parent ptr'} = [$prev_ptr, $tag];
         },
-        End   => sub {
+        End => sub {
             my ($x, $tag) = @_;
-            if ($tag eq 'KeePassFile') {
-            #} elsif ($tag eq 'Meta') {
-            #    $ptr = undef;
-            }
             my $cur_ptr = $ptr;
             ($ptr, my $cur_tag) = @{ delete($ptr->{'parent ptr'}) };
-            if (exists $cur_ptr->{'content'}) {
-                if (1 == scalar keys %$cur_ptr) {
+            my $n_keys = scalar keys %$cur_ptr;
+            if (!$n_keys) {
+                $ptr->{$cur_tag} = ''; # SuppressEmpty
+            } elsif (exists $cur_ptr->{'content'}) {
+                if ($n_keys == 1) {
                     if ('ARRAY' eq $ptr->{$cur_tag}) {
                         $ptr->{$cur_tag}->[-1] = $cur_ptr->{'content'};
                     } else {
                         $ptr->{$cur_tag} = $cur_ptr->{'content'};
                     }
-                } elsif (1 < scalar(keys %$cur_ptr) && $cur_ptr->{'content'} !~ /\S/) {
+                } elsif ($cur_ptr->{'content'} !~ /\S/) {
                     delete $cur_ptr->{'content'};
                 }
             }
         },
-        Char  => sub {
-            my ($x, $data) = @_;
-            $ptr->{'content'} = $data;
-        },
+        Char => sub { if (defined $ptr->{'content'}) { $ptr->{'content'} .= $_[1] } else { $ptr->{'content'} = $_[1] } },
     });
     $x->parse($buffer);
-    use CGI::Ex::Dump qw(debug);
-debug  $data;
-    exit;
-
-    #eval { require XML::Simple } or croak "Cannot load XML library to parse database: $@";
-    #my $data = XML::Simple::XMLin($buffer,
-    #                              ForceArray => [qw(Group Entry String Association Binaries Binary)],
-    #                              SuppressEmpty => '',
-    #                              );
 
     $self->{'xml'} = $buffer if $self->{'keep_xml'};
 
