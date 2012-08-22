@@ -106,6 +106,7 @@ sub clear {
 
 sub parse_db {
     my ($self, $buffer, $pass) = @_;
+    $self = $self->new if ! ref $self;
 
     # parse and verify headers
     my $head = $self->parse_header($buffer);
@@ -124,7 +125,7 @@ sub parse_db {
     }
 
     $self->lock if $self->auto_lock;
-    return 1;
+    return $self;
 }
 
 sub parse_header {
@@ -181,46 +182,36 @@ sub _parse_v2_header {
         $pos += $size;
         if ($type == 1) {
             $h{'comment'} = $val;
-        }
-        elsif ($type == 2) {
+        } elsif ($type == 2) {
             warn "Cipher id did not match AES\n"
                 if $val ne join '', map {chr hex} ("31c1f2e6bf714350be5805216afc5aff" =~ /(..)/g);
             $h{'cipher_id'} = $val;
-        }
-        elsif ($type == 3) {
+        } elsif ($type == 3) {
             $val = unpack 'V', $val;
             warn "Compression was too large.\n" if $val > 1;
             $h{'compression'} = $val;
-        }
-        elsif ($type == 4) {
+        } elsif ($type == 4) {
             warn "Length of seed random was not 32\n" if length($val) != 32;
             $h{'seed_rand'} = $val;
-        }
-        elsif ($type == 5) {
+        } elsif ($type == 5) {
             warn "Length of seed key was not 32\n" if length($val) != 32;
             $h{'seed_key'} = $val;
-        }
-        elsif ($type == 6) {
+        } elsif ($type == 6) {
             $h{'seed_rot_n'} = unpack 'L', $val;
-        }
-        elsif ($type == 7) {
+        } elsif ($type == 7) {
             warn "Length of encryption IV was not 16\n" if length($val) != 16;
             $h{'enc_iv'} = $val;
-        }
-        elsif ($type == 8) {
+        } elsif ($type == 8) {
             warn "Length of stream key was not 32\n" if length($val) != 32;
             $h{'protected_stream_key'} = $val;
-        }
-        elsif ($type == 9) {
+        } elsif ($type == 9) {
             warn "Length of start bytes was not 32\n" if length($val) != 32;
             $h{'start_bytes'} = $val;
-        }
-        elsif ($type == 10) {
+        } elsif ($type == 10) {
             $val = unpack 'V', $val;
             warn "Inner stream id did not match Salsa20\n" if $val != 2;
             $h{'inner_random_stream_id'} = $val;
-        }
-        else {
+        } else {
             warn "Found an unknown header type ($type, $val)\n";
         }
     }
@@ -685,19 +676,6 @@ sub parse_xml {
 
 ###----------------------------------------------------------------###
 
-sub _gen_v1_date {
-    my ($self, $date) = @_;
-    return "\0\0\0\0\0" if ! $date;
-    my ($year, $mon, $day, $hour, $min, $sec) = $date =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/ ? ($1,$2,$3,$4,$5,$6) : die "Invalid date ($date)";
-    return pack('C*',
-                ($year >> 6) & 0b111111,
-                (($year & 0b111111) << 2) | (($mon >> 2) & 0b11),
-                (($mon & 0b11) << 6) | (($day & 0b11111) << 1) | (($hour >> 4) & 0b1),
-                (($hour & 0b1111) << 4) | (($min >> 2) & 0b1111),
-                (($min & 0b11) << 6) | ($sec & 0b111111),
-               );
-}
-
 sub gen_db {
     my ($self, $pass, $groups, $head) = @_;
     $groups ||= $self->groups;
@@ -802,6 +780,19 @@ sub gen_header {
         .pack('L', $args->{'seed_rot_n'});
     die "Invalid generated header\n" if length($header) != DB_HEADER_SIZE;
     return $header;
+}
+
+sub _gen_v1_date {
+    my ($self, $date) = @_;
+    return "\0\0\0\0\0" if ! $date;
+    my ($year, $mon, $day, $hour, $min, $sec) = $date =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/ ? ($1,$2,$3,$4,$5,$6) : die "Invalid date ($date)";
+    return pack('C*',
+                ($year >> 6) & 0b111111,
+                (($year & 0b111111) << 2) | (($mon >> 2) & 0b11),
+                (($mon & 0b11) << 6) | (($day & 0b11111) << 1) | (($hour >> 4) & 0b1),
+                (($hour & 0b1111) << 4) | (($min >> 2) & 0b1111),
+                (($min & 0b11) << 6) | ($sec & 0b111111),
+               );
 }
 
 ###----------------------------------------------------------------###
@@ -1118,13 +1109,14 @@ __END__
 =head1 SYNOPSIS
 
     use File::KeePass;
-    use Data::Dumper qw(Dumper);
+
 
     my $k = File::KeePass->new;
-    if (! eval { $k->load_db($file, $master_pass) }) {
-        die "Couldn't load the file $file: $@";
-    }
 
+    $k->load_db($file, $master_pass); # errors die
+
+
+    use Data::Dumper qw(Dumper);
     print Dumper $k->groups; # passwords are locked
 
     $k->unlock;
