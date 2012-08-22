@@ -311,31 +311,9 @@ sub _parse_v2_body {
     } elsif (!defined($head->{'compression'}) || $head->{'compression'} != 0) {
         croak "Unknown compression type.\n";
     }
-
     $self->{'xml'} = $buffer if $self->{'keep_xml'};
 
-    my %BIN;
-    my $data = $self->parse_xml($buffer, {
-        top => 'KeePassFile',
-        force_array => {map {$_ => 1} qw(Binaries Binary Group Entry String Association)},
-        handlers => {
-            Binary => sub {
-                my ($node, $parent, $parent_tag, $tag) = @_;
-                return if $parent_tag ne 'Binaries';
-                my ($content, $id, $comp) = @$node{qw(content ID Compressed)};
-                $content = $self->decode_base64($content);
-                if ($comp && $comp eq 'True') {
-                    eval { $content = $self->decompress($content) } or warn "Could not decompress associated binary ($id): $@";
-                }
-                warn "Duplicate binary id $id - using most recent.\n" if exists $BIN{$id};
-                $BIN{$id} = $content;
-            },
-            Meta => sub { delete $_[0]->{'Binaries'} },
-        },
-    });
-
-    $head->{'v2_meta'} = delete($data->{'Meta'}) || {};
-
+    # allow for protected string values
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
     my $salsa20 = $self->salsa20(sha256($head->{'protected_stream_key'}), $salsa20_iv, 20);
     my $s20_buf = '';
@@ -346,88 +324,117 @@ sub _parse_v2_body {
         substr $s20_buf, 0, length($enc), '';
         return $data;
     };
-    my $rec; $rec = sub {
-        my $node  = shift || return;
-        my $level = shift || 0;
 
-        my @groups;
-        foreach my $ginfo (@$node) {
-            my $group = {
-                id       => $ginfo->{'UUID'},
-                icon     => $ginfo->{'IconID'},
-                title    => $ginfo->{'Name'},
-                expanded => $tri->($ginfo->{'IsExpanded'}),
-                level    => $level,
-                accessed => $self->_parse_v2_date($ginfo->{'Times'}->{'LastAccessTime'}),
-                expires  => $self->_parse_v2_date($ginfo->{'Times'}->{'ExpiryTime'}),
-                created  => $self->_parse_v2_date($ginfo->{'Times'}->{'CreationTime'}),
-                modified => $self->_parse_v2_date($ginfo->{'Times'}->{'LastModificationTime'}),
-                v2_extra => {
-                    default_auto_type => $ginfo->{'DefaultAutoTypeSequence'},
-                    enable_auto_type  => $tri->($ginfo->{'EnableAutoType'}),
-                    enable_searching  => $tri->($ginfo->{'EnableSearching'}),
-                    last_top_entry    => $ginfo->{'LastTopVisibleEntry'},
-                    custom_icon_uuid  => $ginfo->{'CustomIconUUID'},
-                    expires           => $tri->($ginfo->{'Expires'}),
-                    location_changed  => $self->_parse_v2_date($ginfo->{'Times'}->{'LocationChanged'}),
-                    usage_count       => $ginfo->{'Times'}->{'UsageCount'},
-                    notes             => $ginfo->{'Notes'},
-                },
-                entries => [],
-            };
-            $group->{'v2_raw'} = $ginfo if $self->{'keep_xml'};
-            push @groups, $group;
-            foreach my $einfo (@{ $ginfo->{'Entry'} || [] }) {
-                my %str;
-                for my $s (@{ $einfo->{'String'} || [] }) {
-                    my ($key, $val) = @$s{'Key', 'Value'};
-                    if (ref($val) eq 'HASH' && $val->{'Protected'} && $val->{'Protected'} eq 'True') {
-                        $val = $val->{'content'};
-                        $val = $s20_stream->($self->decode_base64($val)) if length $val;
+    # parse the XML - use our own parser since XML::Simple does not do event based actions
+    my %BIN;
+    my @groups;
+    my $level = 0;
+    my $data = $self->parse_xml($buffer, {
+        top => 'KeePassFile',
+        force_array => {map {$_ => 1} qw(Binaries Binary Group Entry String Association)},
+        start_handlers => {Group => sub { $level++ }},
+        end_handlers => {
+            Meta => sub { delete $_[0]->{'Binaries'}; $head->{'v2_meta'} = delete($_[1]->{'Meta'}) },
+            Binary => sub {
+                my ($node, $parent, $parent_tag, $tag) = @_;
+                if ($parent_tag eq 'Binaries') {
+                    my ($content, $id, $comp) = @$node{qw(content ID Compressed)};
+                    $content = $self->decode_base64($content); # I think some binaries can also be protected
+                    if ($comp && $comp eq 'True') {
+                        eval { $content = $self->decompress($content) } or warn "Could not decompress associated binary ($id): $@";
                     }
-                    $str{$key} = $val;
+                    warn "Duplicate binary id $id - using most recent.\n" if exists $BIN{$id};
+                    $BIN{$id} = $content;
+                } elsif ($parent_tag eq 'Entry') {
+                    my $key = $node->{'Key'};
+                    $key = do { warn "Missing key for binary."; 'unknown' } if ! defined $key;
+                    warn "Duplicate binary key for entry." if $parent->{'__binary__'}->{$key};
+                    $parent->{'__binary__'}->{$key} = $BIN{$node->{'Value'}->{'Ref'}};
                 }
+            },
+            Group => sub {
+                my ($node, $parent, $parent_tag) = @_;
+                my $group = {
+                    id       => $node->{'UUID'},
+                    icon     => $node->{'IconID'},
+                    title    => $node->{'Name'},
+                    expanded => $tri->($node->{'IsExpanded'}),
+                    level    => $level,
+                    accessed => $self->_parse_v2_date($node->{'Times'}->{'LastAccessTime'}),
+                    expires  => $self->_parse_v2_date($node->{'Times'}->{'ExpiryTime'}),
+                    created  => $self->_parse_v2_date($node->{'Times'}->{'CreationTime'}),
+                    modified => $self->_parse_v2_date($node->{'Times'}->{'LastModificationTime'}),
+                    v2_extra => {
+                        default_auto_type => $node->{'DefaultAutoTypeSequence'},
+                        enable_auto_type  => $tri->($node->{'EnableAutoType'}),
+                        enable_searching  => $tri->($node->{'EnableSearching'}),
+                        last_top_entry    => $node->{'LastTopVisibleEntry'},
+                        custom_icon_uuid  => $node->{'CustomIconUUID'},
+                        expires           => $tri->($node->{'Expires'}),
+                        location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
+                        usage_count       => $node->{'Times'}->{'UsageCount'},
+                        notes             => $node->{'Notes'},
+                    },
+                    entries => delete($node->{'__entries__'}) || [],
+                    groups  => delete($node->{'__groups__'})  || [],
+                };
+                $group->{'v2_raw'} = $node if $self->{'keep_xml'};
+                if ($parent_tag eq 'Group') {
+                    push @{ $parent->{'__groups__'} }, $group;
+                } else {
+                    $group->{'__parent_tag__'} = $parent_tag;
+                    push @groups, $group;
+                }
+            },
+            Entry => sub {
+                my ($node, $parent, $parent_tag) = @_;
+                my %str = map {$_->{'Key'} => $_->{'Value'}} @{ $node->{'String'} || [] };
                 my $entry = {
-                    accessed => $self->_parse_v2_date($einfo->{'Times'}->{'LastAccessTime'}),
-                    created  => $self->_parse_v2_date($einfo->{'Times'}->{'CreationTime'}),
-                    expires  => $self->_parse_v2_date($einfo->{'Times'}->{'ExpiryTime'}),
-                    modified => $self->_parse_v2_date($einfo->{'Times'}->{'LastModificationTime'}),
+                    accessed => $self->_parse_v2_date($node->{'Times'}->{'LastAccessTime'}),
+                    created  => $self->_parse_v2_date($node->{'Times'}->{'CreationTime'}),
+                    expires  => $self->_parse_v2_date($node->{'Times'}->{'ExpiryTime'}),
+                    modified => $self->_parse_v2_date($node->{'Times'}->{'LastModificationTime'}),
                     comment  => delete($str{'Notes'}),
-                    icon     => $einfo->{'IconID'},
-                    id       => $einfo->{'UUID'},
+                    icon     => $node->{'IconID'},
+                    id       => $node->{'UUID'},
                     title    => delete($str{'Title'}),
                     url      => delete($str{'URL'}),
                     username => delete($str{'UserName'}),
                     password => delete($str{'Password'}),
                     v2_extra => {
-                        expires           => $tri->($einfo->{'Expires'}),
-                        location_changed  => $self->_parse_v2_date($einfo->{'Times'}->{'LocationChanged'}),
-                        usage_count       => $einfo->{'Times'}->{'UsageCount'},
-                        tags              => $einfo->{'Tags'},
-                        background_color  => $einfo->{'BackgroundColor'},
-                        foreground_color  => $einfo->{'ForegroundColor'},
-                        custom_icon_uuid  => $einfo->{'CustomIconUUID'},
-                        history           => $einfo->{'History'},
-                        override_url      => $einfo->{'OverrideURL'},
-                        auto_type         => $einfo->{'AutoType'},
+                        expires           => $tri->($node->{'Expires'}),
+                        location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
+                        usage_count       => $node->{'Times'}->{'UsageCount'},
+                        tags              => $node->{'Tags'},
+                        background_color  => $node->{'BackgroundColor'},
+                        foreground_color  => $node->{'ForegroundColor'},
+                        custom_icon_uuid  => $node->{'CustomIconUUID'},
+                        history           => $node->{'History'},
+                        override_url      => $node->{'OverrideURL'},
+                        auto_type         => $node->{'AutoType'},
                     },
                 };
-                $entry->{'v2_raw'} = $einfo if $self->{'keep_xml'};
                 $entry->{'v2_extra'}->{'strings'} = \%str if scalar keys %str;
-                foreach my $bin (@{ $einfo->{'Binary'} || [] }) {
-                    my $key = $bin->{'Key'};
-                    $key = do { warn "Missing key for binary."; 'unknown' } if ! defined $key;
-                    warn "Duplicate binary key for entry." if $entry->{'binary'}->{$key};
-                    $entry->{'binary'}->{$key} = $BIN{$bin->{'Value'}->{'Ref'}};
+                $entry->{'binary'} = delete($node->{'__binary__'}) if $node->{'__binary__'};
+                $entry->{'v2_raw'} = $node if $self->{'keep_xml'};
+                push @{ $parent->{'__entries__'} }, $entry;
+            },
+            String => sub {
+                my $node = shift;
+                my $val = $node->{'Value'};
+                if (ref($val) eq 'HASH' && $val->{'Protected'} && $val->{'Protected'} eq 'True') {
+                    $val = $val->{'content'};
+                    $node->{'Value'} = length($val) ? $s20_stream->($self->decode_base64($val)) : '';
                 }
-                push @{ $group->{'entries'} }, $entry;
-            }
-            my $subgroups = $rec->($ginfo->{'Group'}, $level + 1);
-            $group->{'groups'} = $subgroups if $subgroups && @$subgroups;
-        }
-        return \@groups;
-    };
-    return $rec->($data->{'Root'}->{'Group'}) || [];
+            },
+            History => sub {
+                my ($node, $parent, $parent_tag, $tag) = @_;
+                $parent->{$tag} = delete($node->{'__entries__'});
+            },
+        },
+    });
+
+    return \@groups;
 }
 
 ###----------------------------------------------------------------###
@@ -627,7 +634,8 @@ sub parse_xml {
     eval { require XML::Parser } or croak "Cannot load XML library to parse database: $@";
     my $top = $args->{'top'};
     my $force_array = $args->{'force_array'} || {};
-    my $handlers    = $args->{'handlers'}    || {};
+    my $s_handlers  = $args->{'start_handlers'} || {};
+    my $e_handlers  = $args->{'end_handlers'}   || $args->{'handlers'} || {};
     my $data;
     my $ptr;
     my $x = XML::Parser->new(Handlers => {
@@ -645,6 +653,7 @@ sub parse_xml {
                 $ptr = $prev_ptr->{$tag} ||= {};
             }
             @$ptr{keys %attr} = values %attr;
+            $_->($ptr, $prev_ptr, $prev_ptr->{'__tag__'}, $tag) if $_ = $s_handlers->{$tag} || $s_handlers->{'__any__'};
             @$ptr{qw(__parent__ __tag__)} = ($prev_ptr, $tag);
         },
         End => sub {
@@ -666,7 +675,7 @@ sub parse_xml {
                     delete $cur_ptr->{'content'};
                 }
             }
-            $handlers->{$tag}->($cur_ptr, $ptr, $ptr->{'__tag__'}, $tag) if $handlers->{$tag};
+            $_->($cur_ptr, $ptr, $ptr->{'__tag__'}, $tag) if $_ = $e_handlers->{$tag} || $e_handlers->{'__any__'};
         },
         Char => sub { if (defined $ptr->{'content'}) { $ptr->{'content'} .= $_[1] } else { $ptr->{'content'} = $_[1] } },
     });
