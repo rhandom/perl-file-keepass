@@ -52,11 +52,11 @@ sub load_db {
     my $pass = shift || croak "Missing pass\n";
     my $args = shift || {};
 
-    open(my $fh, '<', $file) || croak "Couldn't open $file: $!\n";
+    open my $fh, '<', $file or croak "Could not open $file: $!\n";
     my $size = -s $file;
     read($fh, my $buffer, $size);
     close $fh;
-    croak "Couldn't read entire file contents of $file.\n" if length($buffer) != $size;
+    croak "Could not read entire file contents of $file.\n" if length($buffer) != $size;
     return $self->parse_db($buffer, $pass, $args);
 }
 
@@ -71,10 +71,10 @@ sub save_db {
                              : $self->{'header'}   ? $self->{'header'}->{'header'}
                              : $self->{'version'};
 
-    my $buf = $self->gen_db($pass, undef, $args);
+    my $buf = $self->gen_db($pass, $self->groups, $args);
     my $bak = "$file.bak";
     my $tmp = "$file.new.".int(time());
-    open(my $fh, '>', $tmp) || croak "Couldn't open $tmp: $!\n";
+    open my $fh, '>', $tmp or croak "Could not open $tmp: $!\n";
     print $fh $buf;
     close $fh;
     if (-s $tmp ne length($buf)) {
@@ -84,20 +84,14 @@ sub save_db {
 
     # try to move the file into place
     if (-e $bak) {
-        if (!unlink($bak)) {
-            unlink($tmp);
-            croak "Couldn't removing already existing backup $bak: $!\n";
-        }
+        unlink($bak) or unlink($tmp) or croak "Could not removing already existing backup $bak: $!\n";
     }
     if (-e $file) {
-        if (!rename($file, $bak)) {
-            unlink($tmp);
-            croak "Couldn't backup $file to $bak: $!\n";
-        }
+        rename($file, $bak) or unlink($tmp) or croak "Could not backup $file to $bak: $!\n";
     }
-    rename($tmp, $file) || croak "Couldn't move $tmp to $file: $!\n";
+    rename($tmp, $file) or croak "Could not move $tmp to $file: $!\n";
     if (!$self->{'keep_backup'} && -e $bak) {
-        unlink($bak) || croak "Couldn't removing temporary backup $bak: $!\n";
+        unlink($bak) or croak "Could not removing temporary backup $bak: $!\n";
     }
 
     return 1;
@@ -666,9 +660,10 @@ sub parse_xml {
 ###----------------------------------------------------------------###
 
 sub gen_db {
-    my ($self, $pass, $groups, $head) = @_;
+    my ($self, $pass, $groups, $head, $meta) = @_;
     $groups ||= $self->groups;
     $head   ||= {};
+    $meta   ||= $self->meta;
     croak "Missing pass\n" if ! defined($pass);
     croak "Please unlock before calling gen_db" if $self->is_locked($groups);
 
@@ -684,14 +679,14 @@ sub gen_db {
     $head->{'sig2'}       = DB_SIG_2_v1();
 
     if (($head->{'version'} || $self->{'version'} || '') eq '2') {
-        return $self->_gen_v2_db($pass, $groups, $head);
+        return $self->_gen_v2_db($pass, $groups, $head, $meta);
     } else {
-        return $self->_gen_v1_db($pass, $groups, $head);
+        return $self->_gen_v1_db($pass, $groups, $head, $meta);
     }
 }
 
 sub _gen_v1_db {
-    my ($self, $pass, $groups, $head) = @_;
+    my ($self, $pass, $groups, $head, $meta) = @_;
 
     my $key = $self->_master_v1_key($pass, $head);
 
@@ -781,6 +776,15 @@ sub _gen_v1_date {
                 (($hour & 0b1111) << 4) | (($min >> 2) & 0b1111),
                 (($min & 0b11) << 6) | ($sec & 0b111111),
                );
+}
+
+sub _gen_v2_db {
+    my ($self, $pass, $groups, $head, $meta) = @_;
+
+    my $key = $self->_master_v1_key($pass, $head);
+
+    my $buffer  = '';
+    croak "Not implemented\n";
 }
 
 ###----------------------------------------------------------------###
@@ -886,7 +890,7 @@ sub add_entry {
     $args = {%$args};
     my $group = delete($args->{'group'}) || $groups->[0] || $self->add_group({});
     if (! ref($group)) {
-        $group = $self->find_group({id => $group}, $groups) || croak "Couldn't find a matching group to add entry to";
+        $group = $self->find_group({id => $group}, $groups) || croak "Could not find a matching group to add entry to";
     }
 
     $args->{$_} = ''         for grep {!defined $args->{$_}} qw(title url username password comment bin_desc binary);
