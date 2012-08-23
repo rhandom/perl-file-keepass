@@ -99,7 +99,7 @@ sub save_db {
 
 sub clear {
     my $self = shift;
-    $self->unlock;
+    $self->unlock if $self->{'groups'};
     delete @$self{qw(header meta groups)};
 }
 
@@ -141,9 +141,9 @@ sub _parse_v1_header {
     my ($self, $buffer) = @_;
     my $size = length($buffer);
     croak "File was smaller than db header ($size < ".DB_HEADER_SIZE().")\n" if $size < DB_HEADER_SIZE;
+    my %h = (version => 1, header_size => DB_HEADER_SIZE);
     my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
     my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
-    my %h = (version => 1, header_size => DB_HEADER_SIZE);
     @h{@f} = unpack $t, $buffer;
     croak "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
     $h{'enc_type'} = ($h{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
@@ -154,12 +154,10 @@ sub _parse_v1_header {
 
 sub _parse_v2_header {
     my ($self, $buffer) = @_;
-    my ($sig1, $sig2) = unpack 'LL', $buffer;
-    my %h = (sig1 => $sig1, sig2 => $sig2, version => 2, enc_type => 'rijndael');
-    my $pos = 8;
-    ($h{'ver'}) = unpack "\@$pos L", $buffer;
-    $pos += 4;
+    my %h = (version => 2, enc_type => 'rijndael');
+    @h{qw(sig1 sig2 ver)} = unpack 'L3', $buffer;
     croak "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
+    my $pos = 12;
 
     while (1) {
         my ($type, $size) = unpack "\@$pos CS", $buffer;
@@ -657,26 +655,69 @@ sub parse_xml {
     return $data;
 }
 
+sub gen_xml {
+    my ($self, $ref, $args) = @_;
+    my $indent = !$args->{'indent'} ? '' : $args->{'indent'} eq "1" ? "  " : $args->{'indent'};
+    my $level = 0;
+    my $top = $args->{'top'} || 'root';
+    my $xml = $args->{'declaration'} || '';
+    $xml .= "\n" . ($indent x $level) if $indent;
+    $xml .= "<$top>";
+    my $rec; $rec = sub {
+        $level++;
+        my $ref = shift;
+        my $n = 0;
+        for my $key (sort keys %$ref) {
+            for my $node (ref($ref->{$key}) eq 'ARRAY' ? @{ $ref->{$key} } : $ref->{$key}) {
+                $n++;
+                $xml .= "\n" . ($indent x $level) if $indent;
+                $xml .= "<$key>";
+                if (!ref $node) {
+                    $xml .= $self->escape_xml($node) . "</$key>";
+                    next;
+                }
+                my $had_child = $rec->($node);
+                $xml .= "\n" . ($indent x $level) if $had_child && $indent;
+                $xml .= "</$key>";
+            }
+        }
+        $level--;
+        return $n;
+    };
+    $rec->($ref);
+    $xml .= "\n" . ($indent x $level) if $indent;
+    $xml .= "</$top>";
+    $xml .= "\n" if $indent;
+    return $xml;
+}
+
+sub escape_xml {
+    my $self = shift;
+    local $_ = shift;
+    return '' if ! defined;
+    s/&/&amp;/g;
+    s/</&lt;/g;
+    s/>/&gt;/g;
+    s/"/&quot;/g;
+    s/([^\x00-\x7F])/'&#'.(ord $1).';'/ge;
+    return $_;
+}
+
 ###----------------------------------------------------------------###
 
 sub gen_db {
     my ($self, $pass, $groups, $head, $meta) = @_;
     $groups ||= $self->groups;
-    $head   ||= {};
-    $meta   ||= $self->meta;
+    $head   ||= $self->{'reuse_header'} ? $self->header : {};
+    $meta   ||= eval { $self->meta } || {};
     croak "Missing pass\n" if ! defined($pass);
-    croak "Please unlock before calling gen_db" if $self->is_locked($groups);
+    croak "Please unlock before calling gen_db\n" if $self->is_locked($groups);
 
-    srand((time() ^ $$) * rand()) if ! $self->{'srand'};
-    foreach my $key (qw(seed_rand enc_iv)) {
-        next if defined $head->{$key};
-        $head->{$key} = '';
-        $head->{$key} .= chr(int(255 * rand())) for 1..16;
-    }
-    $head->{'seed_key'}   = sha256(time.rand().$$) if ! defined $head->{'seed_key'};
-    $head->{'seed_rot_n'} = 50_000 if ! defined $head->{'seed_rot_n'};
-    $head->{'sig1'}       = DB_SIG_1();
-    $head->{'sig2'}       = DB_SIG_2_v1();
+    srand((time() ^ $$) * rand()) if ! $self->{'no_srand'};
+    $head->{'enc_iv'}     ||= join '', map {chr rand 256} 1..16;
+    $head->{'seed_rand'}  ||= join '', map {chr rand 256} 1..16;
+    $head->{'seed_key'}   ||= sha256(time.rand().$$);
+    $head->{'seed_rot_n'} ||= $self->{'seed_rot_n'} || 50_000;
 
     if (($head->{'version'} || $self->{'version'} || '') eq '2') {
         return $self->_gen_v2_db($pass, $groups, $head, $meta);
@@ -687,9 +728,7 @@ sub gen_db {
 
 sub _gen_v1_db {
     my ($self, $pass, $groups, $head, $meta) = @_;
-
     my $key = $self->_master_v1_key($pass, $head);
-
     my $buffer  = '';
     my $entries = '';
     my @g = $self->find_groups({}, $groups);
@@ -743,24 +782,26 @@ sub _gen_v1_db {
     $buffer .= $entries; $entries = '';
 
     $head->{'checksum'} = sha256($buffer);
-    $head->{'flags'} = DB_FLAG_RIJNDAEL();
-    $head->{'ver'}   = DB_VER_DW();
 
     return $self->_gen_v1_header($head) . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 }
 
 sub _gen_v1_header {
-    my ($self, $args) = @_;
-    local $args->{'n_groups'}  = $args->{'n_groups'}  || 0;
-    local $args->{'n_entries'} = $args->{'n_entries'} || 0;
+    my ($self, $head) = @_;
+    $head->{'sig1'}  ||= DB_SIG_1;
+    $head->{'sig2'}  ||= DB_SIG_2_v1;
+    $head->{'flags'} ||= DB_FLAG_RIJNDAEL;
+    $head->{'ver'}   ||= DB_VER_DW;
+    $head->{'n_groups'}  ||= 0;
+    $head->{'n_entries'} ||= 0;
     my $header = ''
-        .pack('L4', @{ $args }{qw(sig1 sig2 flags ver)})
-        .$args->{'seed_rand'}
-        .$args->{'enc_iv'}
-        .pack('L2', @{ $args }{qw(n_groups n_entries)})
-        .$args->{'checksum'}
-        .$args->{'seed_key'}
-        .pack('L', $args->{'seed_rot_n'});
+        .pack('L4', @{ $head }{qw(sig1 sig2 flags ver)})
+        .$head->{'seed_rand'}
+        .$head->{'enc_iv'}
+        .pack('L2', @{ $head }{qw(n_groups n_entries)})
+        .$head->{'checksum'}
+        .$head->{'seed_key'}
+        .pack('L', $head->{'seed_rot_n'});
     die "Invalid generated header\n" if length($header) != DB_HEADER_SIZE;
     return $header;
 }
@@ -780,11 +821,237 @@ sub _gen_v1_date {
 
 sub _gen_v2_db {
     my ($self, $pass, $groups, $head, $meta) = @_;
-
-    my $key = $self->_master_v1_key($pass, $head);
-
+    my $key = $self->_master_v2_key($pass, $head);
     my $buffer  = '';
-    croak "Not implemented\n";
+
+    my $untri = sub { return !defined($_[0]) ? 'null' : !$_[0] ? 'false' : 'true' };
+
+    my %META;
+    for my $key (keys %$meta) {
+        (my $copy = "\u\L$key") =~ s/(?:^|_)([a-z])/\u$1/g;
+        $copy =~ s/Uuid/UUID/;
+        next if $copy eq 'Binaries';
+        $META{$copy} = $meta->{$key};
+    }
+    $META{'RecycleBinEnabled'} = $untri->(exists($META{'RecycleBinEnabled'}) ? $META{'RecycleBinEnabled'} : 1);
+    my $p = $META{'MemoryProtection'} ||= {};
+    $p->{'password'} = 1 if ! exists $p->{'password'};
+    for my $key (keys %$p) {
+        $p->{"Protect\u$key"} = delete($p->{$key}) ? 'True' : 'False';
+    }
+
+    my @GROUPS;
+    my $BIN = $META{'Binaries'}->{'Binary'} = [];
+    my @PROTECT_BIN;
+    my @PROTECT_STR;
+    my $data = {
+        Root => {
+            Meta => \%META,
+            Group => \@GROUPS,
+        },
+    };
+
+    # gen the XML - use our own generator since XML::Simple does not do event based actions
+    print $self->gen_xml($data, {
+        top => 'KeePassFile',
+        indent => "\t",
+    });
+    exit;
+
+    my $rec; $rec = sub {
+        my ($group, $parent) = @_;
+        return if ref($group) ne 'HASH';
+    };
+    $rec->($_, \@GROUPS) for @$groups;
+
+    $head->{'protected_stream_key'} ||= join '', map {chr rand 256} 1..32;
+    my $s20_stream = $self->salsa20_stream({key => sha256($head->{'protected_stream_key'}), iv => $salsa20_iv, rounds => 20});
+    for my $ref (@PROTECT_BIN, @PROTECT_STR) {
+        $$ref = $s20_stream->($$ref);
+    }
+
+    #        Binary => sub {
+    #            my ($node, $parent, $parent_tag, $tag) = @_;
+    #            if ($parent_tag eq 'Binaries') {
+    #                my ($content, $id, $comp) = @$node{qw(content ID Compressed)};
+    #                $content = $self->decode_base64($content); # I think some binaries can also be protected
+    #                if ($comp && $comp eq 'True') {
+    #                    eval { $content = $self->decompress($content) } or warn "Could not decompress associated binary ($id): $@";
+    #                }
+    #                warn "Duplicate binary id $id - using most recent.\n" if exists $BIN{$id};
+    #                $BIN{$id} = $content;
+    #            } elsif ($parent_tag eq 'Entry') {
+    #                my $key = $node->{'Key'};
+    #                $key = do { warn "Missing key for binary."; 'unknown' } if ! defined $key;
+    #                warn "Duplicate binary key for entry." if $parent->{'__binary__'}->{$key};
+    #                $parent->{'__binary__'}->{$key} = $BIN{$node->{'Value'}->{'Ref'}};
+    #            }
+    #        },
+    #        Group => sub {
+    #            my ($node, $parent, $parent_tag) = @_;
+    #            my $group = {
+    #                id       => $node->{'UUID'},
+    #                icon     => $node->{'IconID'},
+    #                title    => $node->{'Name'},
+    #                expanded => $tri->($node->{'IsExpanded'}),
+    #                level    => $level,
+    #                accessed => $self->_parse_v2_date($node->{'Times'}->{'LastAccessTime'}),
+    #                expires  => $self->_parse_v2_date($node->{'Times'}->{'ExpiryTime'}),
+    #                created  => $self->_parse_v2_date($node->{'Times'}->{'CreationTime'}),
+    #                modified => $self->_parse_v2_date($node->{'Times'}->{'LastModificationTime'}),
+    #                v2_extra => {
+    #                    default_auto_type => $node->{'DefaultAutoTypeSequence'},
+    #                    enable_auto_type  => $tri->($node->{'EnableAutoType'}),
+    #                    enable_searching  => $tri->($node->{'EnableSearching'}),
+    #                    last_top_entry    => $node->{'LastTopVisibleEntry'},
+    #                    custom_icon_uuid  => $node->{'CustomIconUUID'},
+    #                    expires           => $tri->($node->{'Expires'}),
+    #                    location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
+    #                    usage_count       => $node->{'Times'}->{'UsageCount'},
+    #                    notes             => $node->{'Notes'},
+    #                },
+    #                entries => delete($node->{'__entries__'}) || [],
+    #                groups  => delete($node->{'__groups__'})  || [],
+    #            };
+    #            $group->{'v2_raw'} = $node if $self->{'keep_xml'};
+    #            if ($parent_tag eq 'Group') {
+    #                push @{ $parent->{'__groups__'} }, $group;
+    #            } else {
+    #                $group->{'__parent_tag__'} = $parent_tag;
+    #                push @GROUPS, $group;
+    #            }
+    #        },
+    #        Entry => sub {
+    #            my ($node, $parent, $parent_tag) = @_;
+    #            my %str = map {$_->{'Key'} => $_->{'Value'}} @{ $node->{'String'} || [] };
+    #            my $entry = {
+    #                accessed => $self->_parse_v2_date($node->{'Times'}->{'LastAccessTime'}),
+    #                created  => $self->_parse_v2_date($node->{'Times'}->{'CreationTime'}),
+    #                expires  => $self->_parse_v2_date($node->{'Times'}->{'ExpiryTime'}),
+    #                modified => $self->_parse_v2_date($node->{'Times'}->{'LastModificationTime'}),
+    #                comment  => delete($str{'Notes'}),
+    #                icon     => $node->{'IconID'},
+    #                id       => $node->{'UUID'},
+    #                title    => delete($str{'Title'}),
+    #                url      => delete($str{'URL'}),
+    #                username => delete($str{'UserName'}),
+    #                password => delete($str{'Password'}),
+    #                v2_extra => {
+    #                    expires           => $tri->($node->{'Expires'}),
+    #                    location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
+    #                    usage_count       => $node->{'Times'}->{'UsageCount'},
+    #                    tags              => $node->{'Tags'},
+    #                    background_color  => $node->{'BackgroundColor'},
+    #                    foreground_color  => $node->{'ForegroundColor'},
+    #                    custom_icon_uuid  => $node->{'CustomIconUUID'},
+    #                    history           => $node->{'History'},
+    #                    override_url      => $node->{'OverrideURL'},
+    #                    auto_type         => $node->{'AutoType'},
+    #                },
+    #            };
+    #            $entry->{'v2_extra'}->{'strings'} = \%str if scalar keys %str;
+    #            $entry->{'binary'} = delete($node->{'__binary__'}) if $node->{'__binary__'};
+    #            $entry->{'v2_raw'} = $node if $self->{'keep_xml'};
+    #            push @{ $parent->{'__entries__'} }, $entry;
+    #        },
+    #        String => sub {
+    #            my $node = shift;
+    #            my $val = $node->{'Value'};
+    #            if (ref($val) eq 'HASH' && $val->{'Protected'} && $val->{'Protected'} eq 'True') {
+    #                $val = $val->{'content'};
+    #                $node->{'Value'} = length($val) ? $s20_stream->($self->decode_base64($val)) : '';
+    #            }
+    #        },
+    #        History => sub {
+    #            my ($node, $parent, $parent_tag, $tag) = @_;
+    #            $parent->{$tag} = delete($node->{'__entries__'});
+    #        },
+    #    },
+    #});
+
+    $head->{'compression'} = 1 if ! defined $head->{'compression'};
+    $buffer = $self->compress($buffer) if $head->{'compression'} eq '1';
+    $buffer = $self->unchunksum($buffer);
+
+    $head->{'start_bytes'} ||= join '', map {chr rand 256} 1 .. 32;
+    substr $buffer, 0, 0, $head->{'start_bytes'};
+    $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
+
+    return $self->_gen_v2_header($head) . $buffer;
+}
+
+sub _gen_v2_header {
+    my ($self, $head) = @_;
+
+    $head->{'sig1'}  ||= DB_SIG_1;
+    $head->{'sig2'}  ||= DB_SIG_2_v1;
+    $head->{'flags'} ||= DB_FLAG_RIJNDAEL;
+    $head->{'ver'}   ||= DB_VER_DW;
+    $head->{'n_groups'}  ||= 0;
+    $head->{'n_entries'} ||= 0;
+    my $header = ''
+        .pack('L4', @{ $head }{qw(sig1 sig2 flags ver)})
+        .$head->{'seed_rand'}
+        .$head->{'enc_iv'}
+        .pack('L2', @{ $head }{qw(n_groups n_entries)})
+        .$head->{'checksum'}
+        .$head->{'seed_key'}
+        .pack('L', $head->{'seed_rot_n'});
+    die "Invalid generated header\n" if length($header) != DB_HEADER_SIZE;
+
+    my $buffer;
+    my ($sig1, $sig2) = unpack 'LL', $buffer;
+    my %h = (sig1 => $sig1, sig2 => $sig2, version => 2, enc_type => 'rijndael');
+    my $pos = 8;
+    ($h{'ver'}) = unpack "\@$pos L", $buffer;
+    $pos += 4;
+    croak "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
+
+    while (1) {
+        my ($type, $size) = unpack "\@$pos CS", $buffer;
+        $pos += 3;
+        if (!$type) {
+            $pos += $size;
+            last;
+        }
+        my $val = substr $buffer, $pos, $size; # #my ($val) = unpack "\@$pos a$size", $buffer;
+        $pos += $size;
+        if ($type == 1) {
+            $h{'comment'} = $val;
+        } elsif ($type == 2) {
+            warn "Cipher id did not match AES\n" if $val ne "\x31\xc1\xf2\xe6\xbf\x71\x43\x50\xbe\x58\x05\x21\x6a\xfc\x5a\xff";
+            $h{'cipher'} = 'aes';
+        } elsif ($type == 3) {
+            $val = unpack 'V', $val;
+            warn "Compression was too large.\n" if $val > 1;
+            $h{'compression'} = $val;
+        } elsif ($type == 4) {
+            warn "Length of seed random was not 32\n" if length($val) != 32;
+            $h{'seed_rand'} = $val;
+        } elsif ($type == 5) {
+            warn "Length of seed key was not 32\n" if length($val) != 32;
+            $h{'seed_key'} = $val;
+        } elsif ($type == 6) {
+            $h{'seed_rot_n'} = unpack 'L', $val;
+        } elsif ($type == 7) {
+            warn "Length of encryption IV was not 16\n" if length($val) != 16;
+            $h{'enc_iv'} = $val;
+        } elsif ($type == 8) {
+            warn "Length of stream key was not 32\n" if length($val) != 32;
+            $h{'protected_stream_key'} = $val;
+        } elsif ($type == 9) {
+            warn "Length of start bytes was not 32\n" if length($val) != 32;
+            $h{'start_bytes'} = $val;
+        } elsif ($type == 10) {
+            warn "Inner stream id did not match Salsa20\n" if unpack('V', $val) != 2;
+            $h{'protected_stream'} = 'salsa20';
+        } else {
+            warn "Found an unknown header type ($type, $val)\n";
+        }
+    }
+
+    $h{'header_size'} = $pos;
+    return \%h;
 }
 
 ###----------------------------------------------------------------###
@@ -1618,17 +1885,17 @@ Utilities used for parsing version 1 type databases.
 
 Utilities used for parsing version 2 type databases.
 
-=item _gen_v1_header
-
 =item _gen_v1_db
+
+=item _gen_v1_header
 
 =item _gen_v1_date
 
 Utilities used to generate version 1 type databases.
 
-=item _gen_v2_header
-
 =item _gen_v2_db
+
+=item _gen_v2_header
 
 Utilities used to generate version 2 type databases.
 
