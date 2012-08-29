@@ -52,11 +52,7 @@ sub load_db {
     my $pass = shift || croak "Missing pass\n";
     my $args = shift || {};
 
-    open my $fh, '<', $file or croak "Could not open $file: $!\n";
-    my $size = -s $file;
-    read($fh, my $buffer, $size);
-    close $fh;
-    croak "Could not read entire file contents of $file.\n" if length($buffer) != $size;
+    my $buffer = $self->slurp($file);
     return $self->parse_db($buffer, $pass, $args);
 }
 
@@ -208,20 +204,21 @@ sub _parse_v2_header {
 
 ###----------------------------------------------------------------###
 
-sub _master_v1_key {
+sub _master_key {
     my ($self, $pass, $head) = @_;
-    my $key = sha256($pass);
-    my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
-    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
-    $key = sha256($key);
-    $key = sha256($head->{'seed_rand'}, $key);
-    return $key;
-}
-
-sub _master_v2_key {
-    my ($self, $pass, $head) = @_;
-    my $key = sha256($pass);
-    $key = sha256($key, ()); # this represents the joining of composite data - eventually this would add in File based key as well
+    my $file;
+    ($pass, $file) = @$pass if ref($pass) eq 'ARRAY';
+    $pass = sha256($pass) if defined($pass) && length($pass);
+    if ($file) {
+        $file = $self->slurp($file);
+        if (length($file) == 64) {
+            $file = join '', map {chr hex} ($file =~ /\G([a-f0-9A-F]{2})/g);
+        } elsif (length($file) != 32) {
+            $file = sha256($file);
+        }
+    }
+    my $key = ($head->{'version'} && $head->{'version'} eq '2') ? sha256(grep {$_} $pass, $file)
+            : ($pass && $file) ? sha256($pass, $file) : $pass ? $pass : $file;
     my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
     $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
     $key = sha256($key);
@@ -231,11 +228,8 @@ sub _master_v2_key {
 
 sub _parse_v1_body {
     my ($self, $buffer, $pass, $head) = @_;
-
-    croak "Unimplemented enc_type $head->{'enc_type'}\n"
-        if $head->{'enc_type'} ne 'rijndael';
-
-    my $key = $self->_master_v1_key($pass, $head);
+    croak "Unimplemented enc_type $head->{'enc_type'}\n" if $head->{'enc_type'} ne 'rijndael';
+    my $key = $self->_master_key($pass, $head);
     $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 
     croak "The file could not be decrypted either because the key is wrong or the file is damaged.\n"
@@ -250,8 +244,7 @@ sub _parse_v1_body {
 
 sub _parse_v2_body {
     my ($self, $buffer, $pass, $head) = @_;
-
-    my $key = $self->_master_v2_key($pass, $head);
+    my $key = $self->_master_key($pass, $head);
     $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
     croak "The database key appears invalid or else the database is corrupt.\n"
         if substr($buffer, 0, 32, '') ne $head->{'start_bytes'};
@@ -269,7 +262,7 @@ sub _parse_v2_body {
     my $level = 0;
     my $data = $self->parse_xml($buffer, {
         top            => 'KeePassFile',
-        force_array    => {map {$_ => 1} qw(Binaries Binary Group Entry String Association)},
+        force_array    => {map {$_ => 1} qw(Binaries Binary Group Entry String Association Item)},
         start_handlers => {Group => sub { $level++ }},
         end_handlers   => {
             Meta => sub {
@@ -305,6 +298,10 @@ sub _parse_v2_body {
                 for my $key (keys %$node) {
                     $node->{lc $1} = delete($node->{$key}) eq 'True' ? 1 : 0 if $key =~ /^Protect(\w+)$/;
                 }
+            },
+            CustomData => sub {
+                my ($node, $parent, $parent_tag, $tag) = @_;
+                $parent->{$tag} = {map {$_->{'Key'} => $_->{'Value'}} @{ $node->{'Item'} || [] }}; # is order important?
             },
             Group => sub {
                 my ($node, $parent, $parent_tag) = @_;
@@ -548,6 +545,16 @@ sub _parse_v2_date {
 
 ###----------------------------------------------------------------###
 
+sub slurp {
+    my ($self, $file) = @_;
+    open my $fh, '<', $file or croak "Could not open $file: $!\n";
+    my $size = -s $file || croak "File $file appears to be empty.\n";
+    read($fh, my $buffer, $size);
+    close $fh;
+    croak "Could not read entire file contents of $file.\n" if length($buffer) != $size;
+    return $buffer;
+}
+
 sub decrypt_rijndael_cbc {
     my ($self, $buffer, $key, $enc_iv) = @_;
     my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
@@ -665,7 +672,7 @@ sub gen_xml {
     $xml .= "<$top>";
     my $rec; $rec = sub {
         $level++;
-        my $ref = shift;
+        my ($ref, $tag) = @_;
         my $n = 0;
         for my $key (sort keys %$ref) {
             for my $node (ref($ref->{$key}) eq 'ARRAY' ? @{ $ref->{$key} } : $ref->{$key}) {
@@ -676,15 +683,18 @@ sub gen_xml {
                     $xml .= $self->escape_xml($node) . "</$key>";
                     next;
                 }
-                my $had_child = $rec->($node);
-                $xml .= "\n" . ($indent x $level) if $had_child && $indent;
-                $xml .= "</$key>";
+                if ($rec->($node, $key)) {
+                    $xml .= "\n" . ($indent x $level) if $indent;
+                    $xml .= "</$key>";
+                } else {
+                    $xml =~ s|(>\s*)$| /$1|;
+                }
             }
         }
         $level--;
         return $n;
     };
-    $rec->($ref);
+    $rec->($ref, $top);
     $xml .= "\n" . ($indent x $level) if $indent;
     $xml .= "</$top>";
     $xml .= "\n" if $indent;
@@ -1379,7 +1389,6 @@ __END__
 
     use File::KeePass;
 
-
     my $k = File::KeePass->new;
 
     # read a version 1 or version 2 database
@@ -1438,15 +1447,27 @@ __END__
     # save out a version 2 database
     $k->save_db("/some/file/location.kdbx", $master_pass);
 
+    # save out a version 1 database using a password and key file
+    $k->save_db("/some/file/location.kdb", [$master_pass, $key_filename]);
+
 =head1 DESCRIPTION
 
-File::KeePass gives access to KeePass version 1 (kdb) and
-version 2 (kdbx) databases.
-
+File::KeePass gives access to KeePass version 1 (kdb) and version 2
+(kdbx) databases.
 
 The version 1 and version 2 databases are very different in
-construction, but the majority of information overlaps.  File::KeePass
-attempts to iron out as many of the differences.
+construction, but the majority of information overlaps and many
+algorithms are similar.  File::KeePass attempts to iron out as many of
+the differences.
+
+File::KeePass gives nearly raw data access.  There are a few utility
+methods for manipulating groups and entries.  More advanced
+manipulation can easily be layered on top by other modules.
+
+File::KeePass is only used for reading and writing databases and for
+keeping passwords scrambled while in memory.  Programs dealing with UI
+or using of auto-type features are the domain of other modules on
+CPAN.  File::KeePass::Agent is one example.
 
 =head1 METHODS
 
@@ -1473,6 +1494,20 @@ accessed via various methods including $k->groups.
 
 The contents are read from file and passed to parse_db.
 
+The password passed to load_db may be a composite key in
+any of the following forms:
+
+    "password"                   # password only
+    ["password"]                 # same
+    ["password", "keyfilename"]  # password and key file
+    [undef, "keyfilename"]       # key file only
+
+The key file is optional, but if specified can be of three types:
+
+    length 32         # treated as raw key
+    length 64         # must be 64 hexidecimal characters
+    any-other-length  # a SHA256 sum will be taken of the data
+
 =item save_db
 
 Takes a kdb filename and a master password.  Stores out the current
@@ -1481,6 +1516,8 @@ $file.new.$epoch and are then renamed into the correct location.
 
 You will need to unlock the db via $k->unlock before calling this
 method if the database is currently locked.
+
+The same master password types passed to load_db can be used here.
 
 =item parse_db
 
@@ -1496,6 +1533,8 @@ $k->groups.
     my $k = File::KeePass->parse_db($kdb_buffer, $pwd);
 
     my $k = File::KeePass->parse_db($kdb_buffer, $pwd, {auto_lock => 0});
+
+The same master password types passed to load_db can be used here.
 
 =item parse_header
 
@@ -1517,6 +1556,8 @@ The headers can be passed in to test round trip portability.
 
 You will need to unlock the db via $k->unlock before calling this
 method if the database is currently locked.
+
+The same master password types passed to load_db can be used here.
 
 =item clear
 
@@ -1634,7 +1675,7 @@ on a version 1 database.
 
     meta => {
         color                         => "#4FFF00",
-        custom_data                   => "",
+        custom_data                   => {key1 => "val1"},
         database_description          => "database desc",
         database_description_changed  => "2012-08-17 00:30:56",
         database_name                 => "database name",
@@ -1724,7 +1765,7 @@ passed, the entry will be added to the first group in the database.  A
 new entry id will be created if one is not passed or if it conflicts with
 an existing group.
 
-The following fields can be passed.
+The following fields can be passed to both v1 and v2 databases.
 
     accessed => "2010-06-24 15:09:19", # last accessed date
     bin_desc => "", # description of the stored binary - typically a filename
@@ -1910,9 +1951,7 @@ master key based on database type.
 
 =head1 BUGS
 
-Only Rijndael is supported.
-
-Only passkeys are supported (no key files).
+Only Rijndael is supported when using v1 databases.
 
 This module makes no attempt to act as a password agent.  That is the
 job of File::KeePass::Agent.  This isn't really a bug but some people
