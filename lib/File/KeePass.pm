@@ -321,7 +321,7 @@ sub _parse_v2_body {
                         enable_searching  => $tri->($node->{'EnableSearching'}),
                         last_top_entry    => $node->{'LastTopVisibleEntry'},
                         custom_icon_uuid  => $node->{'CustomIconUUID'},
-                        expires           => $tri->($node->{'Expires'}),
+                        expires           => $tri->($node->{'Times'}->{'Expires'}),
                         location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
                         usage_count       => $node->{'Times'}->{'UsageCount'},
                         notes             => $node->{'Notes'},
@@ -339,7 +339,11 @@ sub _parse_v2_body {
             },
             Entry => sub {
                 my ($node, $parent, $parent_tag) = @_;
-                my %str = map {$_->{'Key'} => $_->{'Value'}} @{ $node->{'String'} || [] };
+                my %str;
+                for my $s (@{ $node->{'String'} || [] }) {
+                    $str{$s->{'Key'}} = $s->{'Value'};
+                    $str{'__protected__'}->{$s->{'Key'}} = 1 if $s->{'__protected__'};
+                }
                 my $entry = {
                     accessed => $self->_parse_v2_date($node->{'Times'}->{'LastAccessTime'}),
                     created  => $self->_parse_v2_date($node->{'Times'}->{'CreationTime'}),
@@ -353,7 +357,7 @@ sub _parse_v2_body {
                     username => delete($str{'UserName'}),
                     password => delete($str{'Password'}),
                     v2_extra => {
-                        expires           => $tri->($node->{'Expires'}),
+                        expires           => $tri->($node->{'Times'}->{'Expires'}),
                         location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
                         usage_count       => $node->{'Times'}->{'UsageCount'},
                         tags              => $node->{'Tags'},
@@ -363,6 +367,7 @@ sub _parse_v2_body {
                         history           => $node->{'History'},
                         override_url      => $node->{'OverrideURL'},
                         auto_type         => $node->{'AutoType'},
+                        protected         => delete($str{'__protected__'}),
                     },
                 };
                 $entry->{'v2_extra'}->{'strings'} = \%str if scalar keys %str;
@@ -376,11 +381,12 @@ sub _parse_v2_body {
                 if (ref($val) eq 'HASH' && $val->{'Protected'} && $val->{'Protected'} eq 'True') {
                     $val = $val->{'content'};
                     $node->{'Value'} = length($val) ? $s20_stream->($self->decode_base64($val)) : '';
+                    $node->{'__protected__'} = 1;
                 }
             },
             History => sub {
                 my ($node, $parent, $parent_tag, $tag) = @_;
-                $parent->{$tag} = delete($node->{'__entries__'});
+                $parent->{$tag} = delete($node->{'__entries__'}) || [];
             },
         },
     });
@@ -584,6 +590,7 @@ sub unchunksum {
             warn "Found mismatch for 0 chunksize\n" if $hash !~ /^\x00{32}$/;
             last;
         }
+        #print "$index $hash $size\n";
         my $chunk = substr $buffer, $pos, $size;
         croak "Chunk hash of index $index did not match\n" if $hash ne sha256($chunk);
         $pos += $size;
@@ -592,20 +599,54 @@ sub unchunksum {
     return $new;
 }
 
+sub chunksum {
+    my ($self, $buffer) = @_;
+    my $new;
+    my $index = 0;
+    my $chunk_size = 8192;
+    my $pos = 0;
+    while ($pos < length($buffer)) {
+        my $chunk = substr($buffer, $pos, $chunk_size);
+        $new .= pack("L a32 i", $index++, sha256($chunk), length($chunk));
+        $new .= $chunk;
+        $pos += length($chunk);
+    }
+    return $new;
+}
+
 sub decompress {
     my ($self, $buffer) = @_;
-    eval { require Compress::Zlib } or croak "Cannot load compression library to decompress database: $@";
-    my ($i, $status) = Compress::Zlib::inflateInit(-WindowBits => 31);
-    croak "Failed to initialize inflator ($status)\n" if $status != Compress::Zlib::Z_OK();
-    ($buffer, $status) = $i->inflate($buffer);
-    croak "Failed to uncompress buffer ($status)\n" if $status != Compress::Zlib::Z_STREAM_END();
-    return $buffer;
+    eval { require Compress::Raw::Zlib } or croak "Cannot load compression library to decompress database: $@";
+    my ($i, $status) = Compress::Raw::Zlib::Inflate->new(-WindowBits => 31);
+    croak "Failed to initialize inflator ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
+    $status = $i->inflate($buffer, my $out);
+    croak "Failed to uncompress buffer ($status)\n" if $status != Compress::Raw::Zlib::Z_STREAM_END();
+    return $out;
+}
+
+sub compress {
+    my ($self, $buffer) = @_;
+    eval { require Compress::Raw::Zlib } or croak "Cannot load compression library to compress database: $@";
+    my ($d, $status) = Compress::Raw::Zlib::Deflate->new(-WindowBits => 31);
+    croak "Failed to initialize inflator ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
+    $status = $d->deflate($buffer, my $out);
+    croak "Failed to compress buffer ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
+    $status = $d->flush($out);
+    croak "Failed to compress buffer ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
+    return $out;
 }
 
 sub decode_base64 {
     my ($self, $content) = @_;
     eval { require MIME::Base64 } or croak "Cannot load Base64 library to decode item: $@";
     return MIME::Base64::decode_base64($content);
+}
+
+sub encode_base64 {
+    my ($self, $content) = @_;
+    eval { require MIME::Base64 } or croak "Cannot load Base64 library to encode item: $@";
+    ($content = MIME::Base64::encode_base64($content)) =~ s/\n//g;
+    return $content;
 }
 
 sub parse_xml {
@@ -668,19 +709,33 @@ sub gen_xml {
     my $level = 0;
     my $top = $args->{'top'} || 'root';
     my $xml = $args->{'declaration'} || '';
-    $xml .= "\n" . ($indent x $level) if $indent;
+    $xml .= "\n" . ($indent x $level) if $xml && $indent;
     $xml .= "<$top>";
     my $rec; $rec = sub {
         $level++;
         my ($ref, $tag) = @_;
         my $n = 0;
-        for my $key (sort keys %$ref) {
+        my $order = delete($ref->{'__sort__'}) || $args->{'sort'}->{$tag} || [sort grep {$_ ne '__attr__'} keys %$ref];
+        for my $key (@$order) {
+            next if ! exists $ref->{$key};
             for my $node (ref($ref->{$key}) eq 'ARRAY' ? @{ $ref->{$key} } : $ref->{$key}) {
                 $n++;
                 $xml .= "\n" . ($indent x $level) if $indent;
-                $xml .= "<$key>";
                 if (!ref $node) {
-                    $xml .= $self->escape_xml($node) . "</$key>";
+                    $xml .= (!defined($node) || !length($node)) ? "<$key />" : "<$key>".$self->escape_xml($node)."</$key>";
+                    next;
+                }
+                if ($node->{'__attr__'} || exists($node->{'content'})) {
+                    $xml .= "<$key".join('', map {" $_=\"".$self->escape_xml($node->{$_})."\""} @{$node->{'__attr__'}||[sort grep {$_ ne 'content'} keys %$node]}).">";
+                } else {
+                    $xml .= "<$key>";
+                }
+                if (exists $node->{'content'}) {
+                    if (defined($node->{'content'}) && length $node->{'content'}) {
+                        $xml .= $self->escape_xml($node->{'content'}) . "</$key>";
+                    } else {
+                        $xml =~ s|(>\s*)$| /$1|;
+                    }
                     next;
                 }
                 if ($rec->($node, $key)) {
@@ -831,168 +886,179 @@ sub _gen_v1_date {
 
 sub _gen_v2_db {
     my ($self, $pass, $groups, $head, $meta) = @_;
-    my $key = $self->_master_v2_key($pass, $head);
+    my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
 
-    my $untri = sub { return !defined($_[0]) ? 'null' : !$_[0] ? 'false' : 'true' };
+    my $untri = sub { return !defined($_[0]) ? 'null' : !$_[0] ? 'False' : 'True' };
 
     my %META;
     for my $key (keys %$meta) {
         (my $copy = "\u\L$key") =~ s/(?:^|_)([a-z])/\u$1/g;
         $copy =~ s/Uuid/UUID/;
         next if $copy eq 'Binaries';
-        $META{$copy} = $meta->{$key};
+        $META{$copy} = ($copy =~ /Changed$/) ? $self->_gen_v2_date($meta->{$key}) : $meta->{$key};
     }
     $META{'RecycleBinEnabled'} = $untri->(exists($META{'RecycleBinEnabled'}) ? $META{'RecycleBinEnabled'} : 1);
     my $p = $META{'MemoryProtection'} ||= {};
     $p->{'password'} = 1 if ! exists $p->{'password'};
-    for my $key (keys %$p) {
-        $p->{"Protect\u$key"} = delete($p->{$key}) ? 'True' : 'False';
-    }
+    for my $key (qw(title username password url notes), sort keys %$p) {
+        my $new = lc($key) eq 'username' ? 'UserName' : lc($key) eq 'url' ? 'URL' : $key;
+        $new = "Protect\u$new";
+        next if exists $p->{$new};
+        $p->{$new} = (exists($p->{$key}) ? delete($p->{$key}) : ($key eq 'password')) ? 'True' : 'False';
+        push @{$p->{'__sort__'}}, $new;
+    } # TODO
+    $META{'__sort__'} = [qw(Generator DatabaseName DatabaseNameChanged DatabaseDescription DatabaseDescriptionChanged DefaultUserName DefaultUserNameChanged
+                            MaintenanceHistoryDays Color MasterKeyChanged MasterKeyChangeRec MasterKeyChangeForce MemoryProtection
+                            RecycleBinEnabled RecycleBinUUID RecycleBinChanged EntryTemplatesGroup EntryTemplatesGroupChanged HistoryMaxItems HistoryMaxSize
+                            LastSelectedGroup LastTopVisibleGroup Binaries CustomData)];
 
     my @GROUPS;
     my $BIN = $META{'Binaries'}->{'Binary'} = [];
     my @PROTECT_BIN;
     my @PROTECT_STR;
     my $data = {
+        Meta => \%META,
         Root => {
-            Meta => \%META,
+            __sort__ => [qw(Group DeletedObjects)],
             Group => \@GROUPS,
+            DeletedObjects => undef,
         },
     };
 
-    # gen the XML - use our own generator since XML::Simple does not do event based actions
-    print $self->gen_xml($data, {
-        top => 'KeePassFile',
-        indent => "\t",
-    });
-    exit;
+    my $gen_entry; $gen_entry = sub {
+        my ($e, $parent) = @_;
+        push @$parent, my $E = {
+            __sort__ => [qw(UUID IconID ForegroundColor BackgroundColor OverrideURL Tags Times String AutoType History)],
+            UUID   => $e->{'id'} || join('',map {sprintf '%02X', rand 256} 10),
+            IconID => $e->{'icon'} || 0,
+            Times  => {
+                __sort__             => [qw(LastModificationTime CreationTime LastAccessTime ExpiryTime Expires UsageCount LocationChanged)],
+                Expires              => $untri->($e->{'v2_extra'}->{'expires'}),
+                UsageCount           => $e->{'v2_extra'}->{'usage_count'} || 0,
+                LastAccessTime       => $self->_gen_v2_date($e->{'accessed'}),
+                ExpiryTime           => $self->_gen_v2_date($e->{'expires'}),
+                CreationTime         => $self->_gen_v2_date($e->{'created'}),
+                LastModificationTime => $self->_gen_v2_date($e->{'modified'}),
+                LocationChanged      => $self->_gen_v2_date($e->{'v2_extra'}->{'location_changed'}),
+            },
+            Tags            => $e->{'v2_extra'}->{'tags'},
+            BackgroundColor => $e->{'v2_extra'}->{'background_color'},
+            ForegroundColor => $e->{'v2_extra'}->{'foreground_color'},
+            CustomIconUUID  => $e->{'v2_extra'}->{'custom_icon_uuid'},
+            OverrideURL     => $e->{'v2_extra'}->{'override_url'},
+            AutoType        => $e->{'v2_extra'}->{'auto_type'},
+        };
+        foreach my $key (sort(keys %{ $e->{'v2_extra'}->{'strings'} || {} }), qw(Notes Password Title URL UserName)) {
+            my $val = ($key eq 'Notes') ? $e->{'comment'} : ($key=~/^(Password|Title|URL|UserName)$/) ? $e->{lc $key} : $e->{'v2_extra'}->{'strings'}->{$key};
+            next if ! defined $val;
+            push @{ $E->{'String'} }, my $s = {
+                Key => $key,
+                Value => $val,
+            };
+            if (($META{'MemoryProtection'}->{"Protect${key}"} || '') eq 'True' || $e->{'v2_extra'}->{'protected'}->{$key}) {
+                $s->{'Value'} = {Protected => 'True', content => $val};
+                push @PROTECT_STR, \$s->{'Value'}->{'content'} if length $s->{'Value'}->{'content'};
+            }
+        }
+        my $bin = $e->{'binary'} || {}; $bin = {__anon__ => $bin} if ref($bin) ne 'HASH';
+        splice @{ $E->{'__sort__'} }, -2, 0, 'Binary' if scalar keys %$bin;
+        foreach my $key (sort keys %$bin) {
+            push @$BIN, my $b = {
+                __attr__ => [qw(ID Compressed)],
+                ID       => $#$BIN+1,
+                content  => defined($bin->{$key}) ? $bin->{$key} : '',
+            };
+            $b->{'Compressed'} = (length($b->{'content'}) < 100 || $self->{'no_binary_compress'}) ? 'False' : 'True';
+            if ($b->{'Compressed'} eq 'True') {
+                eval { $b->{'content'} = $self->compress($b->{'content'}) } or warn "Could not compress associated binary ($b->{'ID'}): $@";
+            }
+            $b->{'content'} = $self->encode_base64($b->{'content'});
+            push @{ $E->{'Binary'} }, {Key => $key, Value => {__attr__ => [qw(Ref)], Ref => $b->{'ID'}, content => ''}};
+        }
+        foreach my $h (@{ $e->{'v2_extra'}->{'history'}||[] }) {
+            $gen_entry->($h, $E->{'History'}->{'Entry'} ||= []);
+        }
+    };
 
     my $rec; $rec = sub {
         my ($group, $parent) = @_;
         return if ref($group) ne 'HASH';
+        push @$parent, my $G = {
+            __sort__ => [qw(UUID Name Notes IconID Times IsExpanded DefaultAutoTypeSequence EnableAutoType EnableSearching LastTopVisibleEntry)],
+            UUID   => $group->{'id'} || join('',map {sprintf '%02X', rand 256} 10),
+            Name   => $group->{'title'} || '',
+            Notes  => $group->{'v2_extra'}->{'notes'},
+            IconID => $group->{'icon'} || 0,
+            Times  => {
+                __sort__             => [qw(LastModificationTime CreationTime LastAccessTime ExpiryTime Expires UsageCount LocationChanged)],
+                Expires              => $untri->($group->{'v2_extra'}->{'expires'}),
+                UsageCount           => $group->{'v2_extra'}->{'usage_count'} || 0,
+                LastAccessTime       => $self->_gen_v2_date($group->{'accessed'}),
+                ExpiryTime           => $self->_gen_v2_date($group->{'expires'}),
+                CreationTime         => $self->_gen_v2_date($group->{'created'}),
+                LastModificationTime => $self->_gen_v2_date($group->{'modified'}),
+                LocationChanged      => $self->_gen_v2_date($group->{'v2_extra'}->{'location_changed'}),
+            },
+            IsExpanded              => $untri->($group->{'expanded'}),
+            DefaultAutoTypeSequence => $group->{'v2_extra'}->{'default_auto_type'},
+            EnableAutoType          => lc($untri->($group->{'v2_extra'}->{'enable_auto_type'})),
+            EnableSearching         => lc($untri->($group->{'v2_extra'}->{'enable_searching'})),
+            LastTopVisibleEntry     => $group->{'v2_extra'}->{'last_top_entry'},
+        };
+        $G->{'CustomIconUUID'} = $group->{'custom_icon_uuid'} if $group->{'custom_icon_uuid'}; # TODO
+        push @{$G->{'__sort__'}}, 'Entry' if @{ $group->{'entries'} || [] };
+        foreach my $e (@{ $group->{'entries'} || [] }) {
+            $gen_entry->($e, $G->{'Entry'} ||= []);
+        }
+        push @{$G->{'__sort__'}}, 'Group' if @{ $group->{'groups'} || [] };
+        $rec->($_, $G->{'Group'} ||= []) for @{ $group->{'groups'} || []};
     };
     $rec->($_, \@GROUPS) for @$groups;
 
     $head->{'protected_stream_key'} ||= join '', map {chr rand 256} 1..32;
     my $s20_stream = $self->salsa20_stream({key => sha256($head->{'protected_stream_key'}), iv => $salsa20_iv, rounds => 20});
     for my $ref (@PROTECT_BIN, @PROTECT_STR) {
-        $$ref = $s20_stream->($$ref);
+        $$ref = $self->encode_base64($s20_stream->($$ref));
     }
 
-    #        Binary => sub {
-    #            my ($node, $parent, $parent_tag, $tag) = @_;
-    #            if ($parent_tag eq 'Binaries') {
-    #                my ($content, $id, $comp) = @$node{qw(content ID Compressed)};
-    #                $content = $self->decode_base64($content); # I think some binaries can also be protected
-    #                if ($comp && $comp eq 'True') {
-    #                    eval { $content = $self->decompress($content) } or warn "Could not decompress associated binary ($id): $@";
-    #                }
-    #                warn "Duplicate binary id $id - using most recent.\n" if exists $BIN{$id};
-    #                $BIN{$id} = $content;
-    #            } elsif ($parent_tag eq 'Entry') {
-    #                my $key = $node->{'Key'};
-    #                $key = do { warn "Missing key for binary."; 'unknown' } if ! defined $key;
-    #                warn "Duplicate binary key for entry." if $parent->{'__binary__'}->{$key};
-    #                $parent->{'__binary__'}->{$key} = $BIN{$node->{'Value'}->{'Ref'}};
-    #            }
-    #        },
-    #        Group => sub {
-    #            my ($node, $parent, $parent_tag) = @_;
-    #            my $group = {
-    #                id       => $node->{'UUID'},
-    #                icon     => $node->{'IconID'},
-    #                title    => $node->{'Name'},
-    #                expanded => $tri->($node->{'IsExpanded'}),
-    #                level    => $level,
-    #                accessed => $self->_parse_v2_date($node->{'Times'}->{'LastAccessTime'}),
-    #                expires  => $self->_parse_v2_date($node->{'Times'}->{'ExpiryTime'}),
-    #                created  => $self->_parse_v2_date($node->{'Times'}->{'CreationTime'}),
-    #                modified => $self->_parse_v2_date($node->{'Times'}->{'LastModificationTime'}),
-    #                v2_extra => {
-    #                    default_auto_type => $node->{'DefaultAutoTypeSequence'},
-    #                    enable_auto_type  => $tri->($node->{'EnableAutoType'}),
-    #                    enable_searching  => $tri->($node->{'EnableSearching'}),
-    #                    last_top_entry    => $node->{'LastTopVisibleEntry'},
-    #                    custom_icon_uuid  => $node->{'CustomIconUUID'},
-    #                    expires           => $tri->($node->{'Expires'}),
-    #                    location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
-    #                    usage_count       => $node->{'Times'}->{'UsageCount'},
-    #                    notes             => $node->{'Notes'},
-    #                },
-    #                entries => delete($node->{'__entries__'}) || [],
-    #                groups  => delete($node->{'__groups__'})  || [],
-    #            };
-    #            $group->{'v2_raw'} = $node if $self->{'keep_xml'};
-    #            if ($parent_tag eq 'Group') {
-    #                push @{ $parent->{'__groups__'} }, $group;
-    #            } else {
-    #                $group->{'__parent_tag__'} = $parent_tag;
-    #                push @GROUPS, $group;
-    #            }
-    #        },
-    #        Entry => sub {
-    #            my ($node, $parent, $parent_tag) = @_;
-    #            my %str = map {$_->{'Key'} => $_->{'Value'}} @{ $node->{'String'} || [] };
-    #            my $entry = {
-    #                accessed => $self->_parse_v2_date($node->{'Times'}->{'LastAccessTime'}),
-    #                created  => $self->_parse_v2_date($node->{'Times'}->{'CreationTime'}),
-    #                expires  => $self->_parse_v2_date($node->{'Times'}->{'ExpiryTime'}),
-    #                modified => $self->_parse_v2_date($node->{'Times'}->{'LastModificationTime'}),
-    #                comment  => delete($str{'Notes'}),
-    #                icon     => $node->{'IconID'},
-    #                id       => $node->{'UUID'},
-    #                title    => delete($str{'Title'}),
-    #                url      => delete($str{'URL'}),
-    #                username => delete($str{'UserName'}),
-    #                password => delete($str{'Password'}),
-    #                v2_extra => {
-    #                    expires           => $tri->($node->{'Expires'}),
-    #                    location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
-    #                    usage_count       => $node->{'Times'}->{'UsageCount'},
-    #                    tags              => $node->{'Tags'},
-    #                    background_color  => $node->{'BackgroundColor'},
-    #                    foreground_color  => $node->{'ForegroundColor'},
-    #                    custom_icon_uuid  => $node->{'CustomIconUUID'},
-    #                    history           => $node->{'History'},
-    #                    override_url      => $node->{'OverrideURL'},
-    #                    auto_type         => $node->{'AutoType'},
-    #                },
-    #            };
-    #            $entry->{'v2_extra'}->{'strings'} = \%str if scalar keys %str;
-    #            $entry->{'binary'} = delete($node->{'__binary__'}) if $node->{'__binary__'};
-    #            $entry->{'v2_raw'} = $node if $self->{'keep_xml'};
-    #            push @{ $parent->{'__entries__'} }, $entry;
-    #        },
-    #        String => sub {
-    #            my $node = shift;
-    #            my $val = $node->{'Value'};
-    #            if (ref($val) eq 'HASH' && $val->{'Protected'} && $val->{'Protected'} eq 'True') {
-    #                $val = $val->{'content'};
-    #                $node->{'Value'} = length($val) ? $s20_stream->($self->decode_base64($val)) : '';
-    #            }
-    #        },
-    #        History => sub {
-    #            my ($node, $parent, $parent_tag, $tag) = @_;
-    #            $parent->{$tag} = delete($node->{'__entries__'});
-    #        },
-    #    },
-    #});
+    # gen the XML - use our own generator since XML::Simple does not do event based actions
+    $buffer = $self->gen_xml($data, {
+        top => 'KeePassFile',
+        indent => "\t",
+        declaration => '<?xml version="1.0" encoding="utf-8" standalone="yes"?>',
+        sort => {
+            AutoType => [qw(Enabled DataTransferObfuscation Association)],
+            Association => [qw(Window KeystrokeSequence)],
+        },
+    });
+
+    $self->{'xml'} = $buffer if $self->{'keep_xml'};
+    print $buffer;
 
     $head->{'compression'} = 1 if ! defined $head->{'compression'};
     $buffer = $self->compress($buffer) if $head->{'compression'} eq '1';
-    $buffer = $self->unchunksum($buffer);
+    $buffer = $self->chunksum($buffer);
 
     $head->{'start_bytes'} ||= join '', map {chr rand 256} 1 .. 32;
     substr $buffer, 0, 0, $head->{'start_bytes'};
-    $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 
-    return $self->_gen_v2_header($head) . $buffer;
+    return;
+    #exit;
+
+    return $self->_gen_v2_header($head) . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
+}
+
+sub _gen_v2_date {
+    my ($self, $date) = @_;
+    $date = $self->now($date) if !$date || $date =~ /^\d+$/;
+    my ($year, $mon, $day, $hour, $min, $sec) = $date =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/ ? ($1,$2,$3,$4,$5,$6) : die "Invalid date ($date)";
+    return "${year}-${mon}-${day}T${hour}:${min}:${sec}Z";
 }
 
 sub _gen_v2_header {
     my ($self, $head) = @_;
-
+    die "on our way";
     $head->{'sig1'}  ||= DB_SIG_1;
     $head->{'sig2'}  ||= DB_SIG_2_v1;
     $head->{'flags'} ||= DB_FLAG_RIJNDAEL;
@@ -1221,7 +1287,8 @@ sub delete_entry {
 }
 
 sub now {
-    my ($sec, $min, $hour, $day, $mon, $year) = localtime;
+    my ($self, $time) = @_;
+    my ($sec, $min, $hour, $day, $mon, $year) = localtime($time || time);
     return sprintf '%04d-%02d-%02d %02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
 }
 
@@ -1846,6 +1913,10 @@ an encrypted string.
 
 Loads the MIME::Base64 library and decodes the passed string.
 
+=item encode_base64
+
+Loads the MIME::Base64 library and encodes the passed string.
+
 =item unchunksum
 
 Parses and reassembles a buffer, reading in lengths, and checksums
@@ -1853,7 +1924,11 @@ of chunks.
 
 =item decompress
 
-Loads the Compress::Zlib library and unzips the contents.
+Loads the Compress::Raw::Zlib library and inflates the contents.
+
+=item compress
+
+Loads the Compress::Raw::Zlib library and deflates the contents.
 
 =item parse_xml
 
@@ -1867,6 +1942,13 @@ XML::Simple::parse.
         start_handlers => {Group => sub { $level++ }},
         end_handlers   => {Group => sub { $level-- }},
     });
+
+=item gen_xml
+
+Generates XML from the passed data structure.  The output of parse_xml
+can be passed as is.  Additionally hints such as __sort__ can be used
+to order the tags of a node and __attr__ can be used to indicate which
+items of a node are attributes.
 
 =item salsa20
 
@@ -1940,9 +2022,7 @@ Utilities used to generate version 1 type databases.
 
 Utilities used to generate version 2 type databases.
 
-=item _master_v1_key
-
-=item _master_v2_key
+=item _master_key
 
 Takes the password and parsed headers.  Returns the
 master key based on database type.
