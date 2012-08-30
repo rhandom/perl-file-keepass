@@ -107,7 +107,6 @@ sub parse_db {
     my ($self, $buffer, $pass, $args) = @_;
     $self = $self->new($args || {}) if ! ref $self;
 
-    # parse and verify headers
     my $head = $self->parse_header($buffer);
     $buffer = substr $buffer, $head->{'header_size'};
 
@@ -158,11 +157,12 @@ sub _parse_v2_header {
     while (1) {
         my ($type, $size) = unpack "\@$pos CS", $buffer;
         $pos += 3;
+        my $val = substr $buffer, $pos, $size; # #my ($val) = unpack "\@$pos a$size", $buffer;
         if (!$type) {
+            $h{'0'} = $val;
             $pos += $size;
             last;
         }
-        my $val = substr $buffer, $pos, $size; # #my ($val) = unpack "\@$pos a$size", $buffer;
         $pos += $size;
         if ($type == 1) {
             $h{'comment'} = $val;
@@ -217,7 +217,8 @@ sub _master_key {
             $file = sha256($file);
         }
     }
-    my $key = ($head->{'version'} && $head->{'version'} eq '2') ? sha256(grep {$_} $pass, $file)
+    my $key = (!$pass && !$file) ? croak "One or both of password or key file must be passed\n"
+            : ($head->{'version'} && $head->{'version'} eq '2') ? sha256(grep {$_} $pass, $file)
             : ($pass && $file) ? sha256($pass, $file) : $pass ? $pass : $file;
     my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
     $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
@@ -251,7 +252,7 @@ sub _parse_v2_body {
 
     $buffer = $self->unchunksum($buffer);
     $buffer = $self->decompress($buffer) if ($head->{'compression'} || '') eq '1';
-    $self->{'xml'} = $buffer if $self->{'keep_xml'};
+    $self->{'xml_in'} = $buffer if $self->{'keep_xml'};
 
     # parse the XML - use our own parser since XML::Simple does not do event based actions
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
@@ -329,7 +330,6 @@ sub _parse_v2_body {
                     entries => delete($node->{'__entries__'}) || [],
                     groups  => delete($node->{'__groups__'})  || [],
                 };
-                $group->{'v2_raw'} = $node if $self->{'keep_xml'};
                 if ($parent_tag eq 'Group') {
                     push @{ $parent->{'__groups__'} }, $group;
                 } else {
@@ -372,7 +372,6 @@ sub _parse_v2_body {
                 };
                 $entry->{'v2_extra'}->{'strings'} = \%str if scalar keys %str;
                 $entry->{'binary'} = delete($node->{'__binary__'}) if $node->{'__binary__'};
-                $entry->{'v2_raw'} = $node if $self->{'keep_xml'};
                 push @{ $parent->{'__entries__'} }, $entry;
             },
             String => sub {
@@ -752,7 +751,7 @@ sub gen_xml {
     $rec->($ref, $top);
     $xml .= "\n" . ($indent x $level) if $indent;
     $xml .= "</$top>";
-    $xml .= "\n" if $indent;
+    $xml .= "\n" if $indent && ! $args->{'no_trailing_newline'};
     return $xml;
 }
 
@@ -1031,10 +1030,9 @@ sub _gen_v2_db {
             AutoType => [qw(Enabled DataTransferObfuscation Association)],
             Association => [qw(Window KeystrokeSequence)],
         },
+        no_trailing_newline => 1,
     });
-
-    $self->{'xml'} = $buffer if $self->{'keep_xml'};
-    print $buffer;
+    $self->{'xml_out'} = $buffer if $self->{'keep_xml'};
 
     $head->{'compression'} = 1 if ! defined $head->{'compression'};
     $buffer = $self->compress($buffer) if $head->{'compression'} eq '1';
@@ -1042,9 +1040,6 @@ sub _gen_v2_db {
 
     $head->{'start_bytes'} ||= join '', map {chr rand 256} 1 .. 32;
     substr $buffer, 0, 0, $head->{'start_bytes'};
-
-    return;
-    #exit;
 
     return $self->_gen_v2_header($head) . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 }
@@ -1058,76 +1053,35 @@ sub _gen_v2_date {
 
 sub _gen_v2_header {
     my ($self, $head) = @_;
-    die "on our way";
-    $head->{'sig1'}  ||= DB_SIG_1;
-    $head->{'sig2'}  ||= DB_SIG_2_v1;
-    $head->{'flags'} ||= DB_FLAG_RIJNDAEL;
-    $head->{'ver'}   ||= DB_VER_DW;
-    $head->{'n_groups'}  ||= 0;
-    $head->{'n_entries'} ||= 0;
-    my $header = ''
-        .pack('L4', @{ $head }{qw(sig1 sig2 flags ver)})
-        .$head->{'seed_rand'}
-        .$head->{'enc_iv'}
-        .pack('L2', @{ $head }{qw(n_groups n_entries)})
-        .$head->{'checksum'}
-        .$head->{'seed_key'}
-        .pack('L', $head->{'seed_rot_n'});
-    die "Invalid generated header\n" if length($header) != DB_HEADER_SIZE;
+    $head->{'sig1'}        ||= DB_SIG_1;
+    $head->{'sig2'}        ||= DB_SIG_2_v2;
+    $head->{'ver'}         ||= DB_VER_DW;
+    $head->{'comment'}     = '' if ! defined $head->{'comment'};
+    $head->{'compression'} = (!$head->{'compression'} || $head->{'compression'} eq '1') ? 1 : 0;
+    $head->{'seed_rand'}   ||= join '', map {chr rand 256} 1..32;
+    $head->{'seed_key'}    ||= join '', map {chr rand 256} 1..32;
+    $head->{'seed_rot_n'}  ||= 6000;
+    $head->{'enc_iv'}      ||= join '', map {chr rand 256} 1..16;
+    $head->{'0'}           ||= "\n";
+    $head->{'protected_stream_key'} ||= join '', map {chr rand 256} 1..32;
+    die "Missing start_bytes\n" if ! $head->{'start_bytes'};
+    die "Length of $_ was not 32\n" for grep {length($head->{$_}) != 32} qw(seed_rand seed_key protected_stream_key start_bytes);
+    die "Length of enc_iv was not 16\n" if length($head->{'enc_iv'}) != 16;
 
-    my $buffer;
-    my ($sig1, $sig2) = unpack 'LL', $buffer;
-    my %h = (sig1 => $sig1, sig2 => $sig2, version => 2, enc_type => 'rijndael');
-    my $pos = 8;
-    ($h{'ver'}) = unpack "\@$pos L", $buffer;
-    $pos += 4;
-    croak "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
-
-    while (1) {
-        my ($type, $size) = unpack "\@$pos CS", $buffer;
-        $pos += 3;
-        if (!$type) {
-            $pos += $size;
-            last;
-        }
-        my $val = substr $buffer, $pos, $size; # #my ($val) = unpack "\@$pos a$size", $buffer;
-        $pos += $size;
-        if ($type == 1) {
-            $h{'comment'} = $val;
-        } elsif ($type == 2) {
-            warn "Cipher id did not match AES\n" if $val ne "\x31\xc1\xf2\xe6\xbf\x71\x43\x50\xbe\x58\x05\x21\x6a\xfc\x5a\xff";
-            $h{'cipher'} = 'aes';
-        } elsif ($type == 3) {
-            $val = unpack 'V', $val;
-            warn "Compression was too large.\n" if $val > 1;
-            $h{'compression'} = $val;
-        } elsif ($type == 4) {
-            warn "Length of seed random was not 32\n" if length($val) != 32;
-            $h{'seed_rand'} = $val;
-        } elsif ($type == 5) {
-            warn "Length of seed key was not 32\n" if length($val) != 32;
-            $h{'seed_key'} = $val;
-        } elsif ($type == 6) {
-            $h{'seed_rot_n'} = unpack 'L', $val;
-        } elsif ($type == 7) {
-            warn "Length of encryption IV was not 16\n" if length($val) != 16;
-            $h{'enc_iv'} = $val;
-        } elsif ($type == 8) {
-            warn "Length of stream key was not 32\n" if length($val) != 32;
-            $h{'protected_stream_key'} = $val;
-        } elsif ($type == 9) {
-            warn "Length of start bytes was not 32\n" if length($val) != 32;
-            $h{'start_bytes'} = $val;
-        } elsif ($type == 10) {
-            warn "Inner stream id did not match Salsa20\n" if unpack('V', $val) != 2;
-            $h{'protected_stream'} = 'salsa20';
-        } else {
-            warn "Found an unknown header type ($type, $val)\n";
-        }
-    }
-
-    $h{'header_size'} = $pos;
-    return \%h;
+    my $buffer = pack 'L3', @$head{qw(sig1 sig2 ver)};
+    my $pack = sub { my ($type, $str) = @_; $buffer .= pack('C S', $type, length($str)) . $str };
+    $pack->(1, $head->{'comment'}) if defined($head->{'comment'}) && length($head->{'comment'});
+    $pack->(2, "\x31\xc1\xf2\xe6\xbf\x71\x43\x50\xbe\x58\x05\x21\x6a\xfc\x5a\xff"); # aes cipher
+    $pack->(3, pack 'V', $head->{'compression'} ? 1 : 0);
+    $pack->(4, $head->{'seed_rand'});
+    $pack->(5, $head->{'seed_key'});
+    $pack->(6, pack 'LL', $head->{'seed_rot_n'}, 0); # a little odd to be double the length but not used
+    $pack->(7, $head->{'enc_iv'});
+    $pack->(8, $head->{'protected_stream_key'});
+    $pack->(9, $head->{'start_bytes'});
+    $pack->(10, pack('V', 2)); # salsa20 protection
+    $pack->(0, $head->{'0'});
+    return $buffer;
 }
 
 ###----------------------------------------------------------------###
