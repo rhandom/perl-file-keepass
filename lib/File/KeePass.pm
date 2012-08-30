@@ -1062,7 +1062,7 @@ sub _gen_v2_header {
     $head->{'seed_key'}    ||= join '', map {chr rand 256} 1..32;
     $head->{'seed_rot_n'}  ||= 6000;
     $head->{'enc_iv'}      ||= join '', map {chr rand 256} 1..16;
-    $head->{'0'}           ||= "\n";
+    $head->{'0'}           ||= "\r\n\r\n";
     $head->{'protected_stream_key'} ||= join '', map {chr rand 256} 1..32;
     die "Missing start_bytes\n" if ! $head->{'start_bytes'};
     die "Length of $_ was not 32\n" for grep {length($head->{$_}) != 32} qw(seed_rand seed_key protected_stream_key start_bytes);
