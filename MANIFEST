@@ -6,3 +6,4 @@ MANIFEST.SKIP
 META.yml
 README
 t/00_base.t
+t/01_kdbx.t
