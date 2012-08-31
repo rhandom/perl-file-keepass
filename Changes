@@ -1,3 +1,8 @@
+0.04
+    2012-08-30
+        * Add kdbx (version 2) reading and writing.
+        * Allow for using a password, a key file, or a password and a key file.
+
 0.03
     2010-12-06
         * Further corrections on parse_groups bug that was further pointed out by Lester Hightower with a correct fix offered Brian De Wolf.
