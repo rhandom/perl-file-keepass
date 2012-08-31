@@ -8,18 +8,15 @@ File::KeePass - Interface to KeePass V1 database files
 
 use strict;
 use warnings;
-use Carp qw(croak);
 use Crypt::Rijndael;
 use Digest::SHA qw(sha256);
 
-use constant DB_HEADER_SIZE   => 124;
+use constant DB_HEADSIZE_V1   => 124;
 use constant DB_SIG_1         => 0x9AA2D903;
 use constant DB_SIG_2_v1      => 0xB54BFB65;
 use constant DB_SIG_2_v2      => 0xB54BFB67;
 use constant DB_VER_DW        => 0x00030002;
-use constant DB_FLAG_SHA2     => 1;
 use constant DB_FLAG_RIJNDAEL => 2;
-use constant DB_FLAG_ARCFOUR  => 4;
 use constant DB_FLAG_TWOFISH  => 8;
 
 our $VERSION = '0.03';
@@ -38,18 +35,18 @@ sub auto_lock {
     return !exists($self->{'auto_lock'}) || $self->{'auto_lock'};
 }
 
-sub groups { shift->{'groups'} || croak "No groups loaded yet\n" }
+sub groups { shift->{'groups'} || die "No groups loaded yet\n" }
 
-sub header { shift->{'header'} || croak "No header loaded yet\n" }
+sub header { shift->{'header'} || die "No header loaded yet\n" }
 
-sub meta { shift->{'meta'} || croak "No meta information loaded yet\n" }
+sub meta { shift->{'meta'} || die "No meta information loaded yet\n" }
 
 ###----------------------------------------------------------------###
 
 sub load_db {
     my $self = shift;
-    my $file = shift || croak "Missing file\n";
-    my $pass = shift || croak "Missing pass\n";
+    my $file = shift || die "Missing file\n";
+    my $pass = shift || die "Missing pass\n";
     my $args = shift || {};
 
     my $buffer = $self->slurp($file);
@@ -57,37 +54,38 @@ sub load_db {
 }
 
 sub save_db {
-    my $self = shift;
-    my $file = shift || croak "Missing file\n";
-    my $pass = shift || croak "Missing pass\n";
-    my $args = shift || {};
+    my ($self, $file, $pass, $args, $meta, $groups) = @_;
+    $args   ||= $self->{'reuse_header'} ? $self->header : {};
+    $meta   ||= eval { $self->meta } || {};
+    $groups ||= $self->groups;
+    die "Missing file\n" if ! $file;
     local $args->{'version'} = $args->{'version'}  ? $args->{'version'}
                              : $file =~ /\.kdbx$/i ? 2
                              : $file =~ /\.kdb$/i  ? 1
                              : $self->{'header'}   ? $self->{'header'}->{'header'}
                              : $self->{'version'};
 
-    my $buf = $self->gen_db($pass, $self->groups, $args);
+    my $buf = $self->gen_db($pass, $args, $meta, $groups);
     my $bak = "$file.bak";
     my $tmp = "$file.new.".int(time());
-    open my $fh, '>', $tmp or croak "Could not open $tmp: $!\n";
+    open my $fh, '>', $tmp or die "Could not open $tmp: $!\n";
     print $fh $buf;
     close $fh;
     if (-s $tmp ne length($buf)) {
-        croak "Written file size of $tmp didn't match (".(-s $tmp)." != ".length($buf).") - not moving into place\n";
+        die "Written file size of $tmp didn't match (".(-s $tmp)." != ".length($buf).") - not moving into place\n";
         unlink($tmp);
     }
 
     # try to move the file into place
     if (-e $bak) {
-        unlink($bak) or unlink($tmp) or croak "Could not removing already existing backup $bak: $!\n";
+        unlink($bak) or unlink($tmp) or die "Could not removing already existing backup $bak: $!\n";
     }
     if (-e $file) {
-        rename($file, $bak) or unlink($tmp) or croak "Could not backup $file to $bak: $!\n";
+        rename($file, $bak) or unlink($tmp) or die "Could not backup $file to $bak: $!\n";
     }
-    rename($tmp, $file) or croak "Could not move $tmp to $file: $!\n";
+    rename($tmp, $file) or die "Could not move $tmp to $file: $!\n";
     if (!$self->{'keep_backup'} && -e $bak) {
-        unlink($bak) or croak "Could not removing temporary backup $bak: $!\n";
+        unlink($bak) or die "Could not removing temporary backup $bak: $!\n";
     }
 
     return 1;
@@ -116,7 +114,7 @@ sub parse_db {
 
     my $meth = ($head->{'version'} == 1) ? '_parse_v1_body'
              : ($head->{'version'} == 2) ? '_parse_v2_body'
-             : croak "Unsupported keepass database version ($head->{'version'})\n";
+             : die "Unsupported keepass database version ($head->{'version'})\n";
     @$self{qw(meta groups)} = $self->$meth($buffer, $pass, $head);
 
     $self->lock if $self->auto_lock;
@@ -126,21 +124,21 @@ sub parse_db {
 sub parse_header {
     my ($self, $buffer) = @_;
     my ($sig1, $sig2) = unpack 'LL', $buffer;
-    croak "File signature (sig1) did not match ($sig1 != ".DB_SIG_1().")\n" if $sig1 != DB_SIG_1;
+    die "File signature (sig1) did not match ($sig1 != ".DB_SIG_1().")\n" if $sig1 != DB_SIG_1;
     return $self->_parse_v1_header($buffer) if $sig2 eq DB_SIG_2_v1;
     return $self->_parse_v2_header($buffer) if $sig2 eq DB_SIG_2_v2;
-    croak "Second file signature did not match ($sig2 != ".DB_SIG_2_v1()." or ".DB_SIG_2_v2().")\n";
+    die "Second file signature did not match ($sig2 != ".DB_SIG_2_v1()." or ".DB_SIG_2_v2().")\n";
 }
 
 sub _parse_v1_header {
     my ($self, $buffer) = @_;
     my $size = length($buffer);
-    croak "File was smaller than db header ($size < ".DB_HEADER_SIZE().")\n" if $size < DB_HEADER_SIZE;
-    my %h = (version => 1, header_size => DB_HEADER_SIZE);
+    die "File was smaller than db header ($size < ".DB_HEADSIZE_V1().")\n" if $size < DB_HEADSIZE_V1;
+    my %h = (version => 1, header_size => DB_HEADSIZE_V1);
     my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
     my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
     @h{@f} = unpack $t, $buffer;
-    croak "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
+    die "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
     $h{'enc_type'} = ($h{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
                    : ($h{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
                    : die "Unknown encryption type\n";
@@ -151,7 +149,7 @@ sub _parse_v2_header {
     my ($self, $buffer) = @_;
     my %h = (version => 2, enc_type => 'rijndael');
     @h{qw(sig1 sig2 ver)} = unpack 'L3', $buffer;
-    croak "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
+    die "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
     my $pos = 12;
 
     while (1) {
@@ -217,9 +215,14 @@ sub _master_key {
             $file = sha256($file);
         }
     }
-    my $key = (!$pass && !$file) ? croak "One or both of password or key file must be passed\n"
+    my $key = (!$pass && !$file) ? die "One or both of password or key file must be passed\n"
             : ($head->{'version'} && $head->{'version'} eq '2') ? sha256(grep {$_} $pass, $file)
             : ($pass && $file) ? sha256($pass, $file) : $pass ? $pass : $file;
+    $head->{'enc_iv'}     ||= join '', map {chr rand 256} 1..16;
+    $head->{'seed_rand'}  ||= join '', map {chr rand 256} 1..($head->{'version'} && $head->{'version'} eq '2' ? 32 : 16);
+    $head->{'seed_key'}   ||= sha256(time.rand().$$);
+    $head->{'seed_rot_n'} ||= $self->{'seed_rot_n'} || 50_000;
+
     my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
     $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
     $key = sha256($key);
@@ -229,13 +232,13 @@ sub _master_key {
 
 sub _parse_v1_body {
     my ($self, $buffer, $pass, $head) = @_;
-    croak "Unimplemented enc_type $head->{'enc_type'}\n" if $head->{'enc_type'} ne 'rijndael';
+    die "Unimplemented enc_type $head->{'enc_type'}\n" if $head->{'enc_type'} ne 'rijndael';
     my $key = $self->_master_key($pass, $head);
     $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 
-    croak "The file could not be decrypted either because the key is wrong or the file is damaged.\n"
+    die "The file could not be decrypted either because the key is wrong or the file is damaged.\n"
         if length($buffer) > 2**31 || (!length($buffer) && $head->{'n_groups'});
-    croak "The file checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)\n"
+    die "The file checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)\n"
         if $head->{'checksum'} ne sha256($buffer);
 
     my ($groups, $gmap, $pos) = $self->_parse_v1_groups($buffer, $head->{'n_groups'});
@@ -247,12 +250,11 @@ sub _parse_v2_body {
     my ($self, $buffer, $pass, $head) = @_;
     my $key = $self->_master_key($pass, $head);
     $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
-    croak "The database key appears invalid or else the database is corrupt.\n"
+    die "The database key appears invalid or else the database is corrupt.\n"
         if substr($buffer, 0, 32, '') ne $head->{'start_bytes'};
-
     $buffer = $self->unchunksum($buffer);
-    $buffer = $self->decompress($buffer) if ($head->{'compression'} || '') eq '1';
-    $self->{'xml_in'} = $buffer if $self->{'keep_xml'};
+    $buffer = eval { $self->decompress($buffer) } or die "Failed to decompress document: $@" if ($head->{'compression'} || '') eq '1';
+    $self->{'xml_in'} = $buffer if $self->{'keep_xml'} || $head->{'keep_xml'};
 
     # parse the XML - use our own parser since XML::Simple does not do event based actions
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
@@ -268,7 +270,7 @@ sub _parse_v2_body {
         end_handlers   => {
             Meta => sub {
                 my ($node, $parent) = @_;
-                croak "Found multiple intances of Meta.\n" if $META;
+                die "Found multiple intances of Meta.\n" if $META;
                 $META = {};
                 for my $key (keys %$node) {
                     next if $key eq 'Binaries';
@@ -550,249 +552,26 @@ sub _parse_v2_date {
 
 ###----------------------------------------------------------------###
 
-sub slurp {
-    my ($self, $file) = @_;
-    open my $fh, '<', $file or croak "Could not open $file: $!\n";
-    my $size = -s $file || croak "File $file appears to be empty.\n";
-    read($fh, my $buffer, $size);
-    close $fh;
-    croak "Could not read entire file contents of $file.\n" if length($buffer) != $size;
-    return $buffer;
-}
-
-sub decrypt_rijndael_cbc {
-    my ($self, $buffer, $key, $enc_iv) = @_;
-    my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
-    $cipher->set_iv($enc_iv);
-    $buffer = $cipher->decrypt($buffer);
-    my $extra = ord(substr $buffer, -1, 1);
-    substr($buffer, length($buffer) - $extra, $extra, '');
-    return $buffer;
-}
-
-sub encrypt_rijndael_cbc {
-    my ($self, $buffer, $key, $enc_iv) = @_;
-    my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
-    $cipher->set_iv($enc_iv);
-    my $extra = (16 - length($buffer) % 16) || 16; # always pad so we can always trim
-    $buffer .= chr($extra) for 1 .. $extra;
-    return $cipher->encrypt($buffer);
-}
-
-sub unchunksum {
-    my ($self, $buffer) = @_;
-    my ($new, $pos) = ('', 0);
-    while ($pos < length($buffer)) {
-        my ($index, $hash, $size) = unpack "\@$pos L a32 i", $buffer;
-        $pos += 40;
-        if ($size == 0) {
-            warn "Found mismatch for 0 chunksize\n" if $hash !~ /^\x00{32}$/;
-            last;
-        }
-        #print "$index $hash $size\n";
-        my $chunk = substr $buffer, $pos, $size;
-        croak "Chunk hash of index $index did not match\n" if $hash ne sha256($chunk);
-        $pos += $size;
-        $new .= $chunk;
-    }
-    return $new;
-}
-
-sub chunksum {
-    my ($self, $buffer) = @_;
-    my $new;
-    my $index = 0;
-    my $chunk_size = 8192;
-    my $pos = 0;
-    while ($pos < length($buffer)) {
-        my $chunk = substr($buffer, $pos, $chunk_size);
-        $new .= pack("L a32 i", $index++, sha256($chunk), length($chunk));
-        $new .= $chunk;
-        $pos += length($chunk);
-    }
-    return $new;
-}
-
-sub decompress {
-    my ($self, $buffer) = @_;
-    eval { require Compress::Raw::Zlib } or croak "Cannot load compression library to decompress database: $@";
-    my ($i, $status) = Compress::Raw::Zlib::Inflate->new(-WindowBits => 31);
-    croak "Failed to initialize inflator ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
-    $status = $i->inflate($buffer, my $out);
-    croak "Failed to uncompress buffer ($status)\n" if $status != Compress::Raw::Zlib::Z_STREAM_END();
-    return $out;
-}
-
-sub compress {
-    my ($self, $buffer) = @_;
-    eval { require Compress::Raw::Zlib } or croak "Cannot load compression library to compress database: $@";
-    my ($d, $status) = Compress::Raw::Zlib::Deflate->new(-WindowBits => 31);
-    croak "Failed to initialize inflator ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
-    $status = $d->deflate($buffer, my $out);
-    croak "Failed to compress buffer ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
-    $status = $d->flush($out);
-    croak "Failed to compress buffer ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
-    return $out;
-}
-
-sub decode_base64 {
-    my ($self, $content) = @_;
-    eval { require MIME::Base64 } or croak "Cannot load Base64 library to decode item: $@";
-    return MIME::Base64::decode_base64($content);
-}
-
-sub encode_base64 {
-    my ($self, $content) = @_;
-    eval { require MIME::Base64 } or croak "Cannot load Base64 library to encode item: $@";
-    ($content = MIME::Base64::encode_base64($content)) =~ s/\n//g;
-    return $content;
-}
-
-sub parse_xml {
-    my ($self, $buffer, $args) = @_;
-    eval { require XML::Parser } or croak "Cannot load XML library to parse database: $@";
-    my $top = $args->{'top'};
-    my $force_array = $args->{'force_array'} || {};
-    my $s_handlers  = $args->{'start_handlers'} || {};
-    my $e_handlers  = $args->{'end_handlers'}   || $args->{'handlers'} || {};
-    my $data;
-    my $ptr;
-    my $x = XML::Parser->new(Handlers => {
-        Start => sub {
-            my ($x, $tag, %attr) = @_; # loses multiple values of duplicately named attrs
-            my $prev_ptr = $ptr;
-            $top = $tag if !defined $top;
-            if ($tag eq $top) {
-                croak "The $top tag should only be used at the top level.\n" if $ptr || $data;
-                $ptr = $data = {};
-            } elsif (exists($prev_ptr->{$tag})  || ($force_array->{$tag} and $prev_ptr->{$tag} ||= [])) {
-                $prev_ptr->{$tag} = [$prev_ptr->{$tag}] if 'ARRAY' ne ref $prev_ptr->{$tag};
-                push @{ $prev_ptr->{$tag} }, ($ptr = {});
-            } else {
-                $ptr = $prev_ptr->{$tag} ||= {};
-            }
-            @$ptr{keys %attr} = values %attr;
-            $_->($ptr, $prev_ptr, $prev_ptr->{'__tag__'}, $tag) if $_ = $s_handlers->{$tag} || $s_handlers->{'__any__'};
-            @$ptr{qw(__parent__ __tag__)} = ($prev_ptr, $tag);
-        },
-        End => sub {
-            my ($x, $tag) = @_;
-            my $cur_ptr = $ptr;
-            $ptr = delete $cur_ptr->{'__parent__'};
-            die "End tag mismatch on $tag.\n" if $tag ne delete($cur_ptr->{'__tag__'});
-            my $n_keys = scalar keys %$cur_ptr;
-            if (!$n_keys) {
-                $ptr->{$tag} = ''; # SuppressEmpty
-            } elsif (exists $cur_ptr->{'content'}) {
-                if ($n_keys == 1) {
-                    if ($ptr->{$tag} eq 'ARRAY') {
-                        $ptr->{$tag}->[-1] = $cur_ptr->{'content'};
-                    } else {
-                        $ptr->{$tag} = $cur_ptr->{'content'};
-                    }
-                } elsif ($cur_ptr->{'content'} !~ /\S/) {
-                    delete $cur_ptr->{'content'};
-                }
-            }
-            $_->($cur_ptr, $ptr, $ptr->{'__tag__'}, $tag) if $_ = $e_handlers->{$tag} || $e_handlers->{'__any__'};
-        },
-        Char => sub { if (defined $ptr->{'content'}) { $ptr->{'content'} .= $_[1] } else { $ptr->{'content'} = $_[1] } },
-    });
-    $x->parse($buffer);
-    return $data;
-}
-
-sub gen_xml {
-    my ($self, $ref, $args) = @_;
-    my $indent = !$args->{'indent'} ? '' : $args->{'indent'} eq "1" ? "  " : $args->{'indent'};
-    my $level = 0;
-    my $top = $args->{'top'} || 'root';
-    my $xml = $args->{'declaration'} || '';
-    $xml .= "\n" . ($indent x $level) if $xml && $indent;
-    $xml .= "<$top>";
-    my $rec; $rec = sub {
-        $level++;
-        my ($ref, $tag) = @_;
-        my $n = 0;
-        my $order = delete($ref->{'__sort__'}) || $args->{'sort'}->{$tag} || [sort grep {$_ ne '__attr__'} keys %$ref];
-        for my $key (@$order) {
-            next if ! exists $ref->{$key};
-            for my $node (ref($ref->{$key}) eq 'ARRAY' ? @{ $ref->{$key} } : $ref->{$key}) {
-                $n++;
-                $xml .= "\n" . ($indent x $level) if $indent;
-                if (!ref $node) {
-                    $xml .= (!defined($node) || !length($node)) ? "<$key />" : "<$key>".$self->escape_xml($node)."</$key>";
-                    next;
-                }
-                if ($node->{'__attr__'} || exists($node->{'content'})) {
-                    $xml .= "<$key".join('', map {" $_=\"".$self->escape_xml($node->{$_})."\""} @{$node->{'__attr__'}||[sort grep {$_ ne 'content'} keys %$node]}).">";
-                } else {
-                    $xml .= "<$key>";
-                }
-                if (exists $node->{'content'}) {
-                    if (defined($node->{'content'}) && length $node->{'content'}) {
-                        $xml .= $self->escape_xml($node->{'content'}) . "</$key>";
-                    } else {
-                        $xml =~ s|(>\s*)$| /$1|;
-                    }
-                    next;
-                }
-                if ($rec->($node, $key)) {
-                    $xml .= "\n" . ($indent x $level) if $indent;
-                    $xml .= "</$key>";
-                } else {
-                    $xml =~ s|(>\s*)$| /$1|;
-                }
-            }
-        }
-        $level--;
-        return $n;
-    };
-    $rec->($ref, $top);
-    $xml .= "\n" . ($indent x $level) if $indent;
-    $xml .= "</$top>";
-    $xml .= "\n" if $indent && ! $args->{'no_trailing_newline'};
-    return $xml;
-}
-
-sub escape_xml {
-    my $self = shift;
-    local $_ = shift;
-    return '' if ! defined;
-    s/&/&amp;/g;
-    s/</&lt;/g;
-    s/>/&gt;/g;
-    s/"/&quot;/g;
-    s/([^\x00-\x7F])/'&#'.(ord $1).';'/ge;
-    return $_;
-}
-
-###----------------------------------------------------------------###
-
 sub gen_db {
-    my ($self, $pass, $groups, $head, $meta) = @_;
-    $groups ||= $self->groups;
+    my ($self, $pass, $head, $meta, $groups) = @_;
     $head   ||= $self->{'reuse_header'} ? $self->header : {};
     $meta   ||= eval { $self->meta } || {};
-    croak "Missing pass\n" if ! defined($pass);
-    croak "Please unlock before calling gen_db\n" if $self->is_locked($groups);
+    $groups ||= $self->groups;
+    die "Missing pass\n" if ! defined($pass);
+    die "Please unlock before calling gen_db\n" if $self->is_locked($groups);
 
     srand((time() ^ $$) * rand()) if ! $self->{'no_srand'};
-    $head->{'enc_iv'}     ||= join '', map {chr rand 256} 1..16;
-    $head->{'seed_rand'}  ||= join '', map {chr rand 256} 1..16;
-    $head->{'seed_key'}   ||= sha256(time.rand().$$);
-    $head->{'seed_rot_n'} ||= $self->{'seed_rot_n'} || 50_000;
-
     if (($head->{'version'} || $self->{'version'} || '') eq '2') {
-        return $self->_gen_v2_db($pass, $groups, $head, $meta);
+        $head->{'version'} = '2';
+        return $self->_gen_v2_db($pass, $head, $meta, $groups);
     } else {
-        return $self->_gen_v1_db($pass, $groups, $head, $meta);
+        return $self->_gen_v1_db($pass, $head, $meta, $groups);
     }
 }
 
 sub _gen_v1_db {
-    my ($self, $pass, $groups, $head, $meta) = @_;
-    my $key = $self->_master_v1_key($pass, $head);
+    my ($self, $pass, $head, $meta, $groups) = @_;
+    my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
     my $entries = '';
     my @g = $self->find_groups({}, $groups);
@@ -802,7 +581,7 @@ sub _gen_v1_db {
             title    => 'Meta-Info',
             username => 'SYSTEM',
             url      => '$',
-            id     => '00000000000000000000000000000000',
+            id       => '00000000000000000000000000000000',
             group    => $g[0],
         });
         $e->{'bin_desc'} = 'bin-stream';
@@ -858,15 +637,18 @@ sub _gen_v1_header {
     $head->{'ver'}   ||= DB_VER_DW;
     $head->{'n_groups'}  ||= 0;
     $head->{'n_entries'} ||= 0;
-    my $header = ''
-        .pack('L4', @{ $head }{qw(sig1 sig2 flags ver)})
-        .$head->{'seed_rand'}
-        .$head->{'enc_iv'}
-        .pack('L2', @{ $head }{qw(n_groups n_entries)})
-        .$head->{'checksum'}
-        .$head->{'seed_key'}
-        .pack('L', $head->{'seed_rot_n'});
-    die "Invalid generated header\n" if length($header) != DB_HEADER_SIZE;
+    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
+    my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
+    my $header = pack $t, @$head{@f};
+    #my $header = ''
+    #    .pack('L4', @{ $head }{qw(sig1 sig2 flags ver)})
+    #    .$head->{'seed_rand'}
+    #    .$head->{'enc_iv'}
+    #    .pack('L2', @{ $head }{qw(n_groups n_entries)})
+    #    .$head->{'checksum'}
+    #    .$head->{'seed_key'}
+    #    .pack('L', $head->{'seed_rot_n'});
+    die "Invalid generated header\n" if length($header) != DB_HEADSIZE_V1;
     return $header;
 }
 
@@ -884,7 +666,7 @@ sub _gen_v1_date {
 }
 
 sub _gen_v2_db {
-    my ($self, $pass, $groups, $head, $meta) = @_;
+    my ($self, $pass, $head, $meta, $groups) = @_;
     my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
 
@@ -1032,7 +814,7 @@ sub _gen_v2_db {
         },
         no_trailing_newline => 1,
     });
-    $self->{'xml_out'} = $buffer if $self->{'keep_xml'};
+    $self->{'xml_out'} = $buffer if $self->{'keep_xml'} || $head->{'keep_xml'};
 
     $head->{'compression'} = 1 if ! defined $head->{'compression'};
     $buffer = $self->compress($buffer) if $head->{'compression'} eq '1';
@@ -1058,14 +840,10 @@ sub _gen_v2_header {
     $head->{'ver'}         ||= DB_VER_DW;
     $head->{'comment'}     = '' if ! defined $head->{'comment'};
     $head->{'compression'} = (!$head->{'compression'} || $head->{'compression'} eq '1') ? 1 : 0;
-    $head->{'seed_rand'}   ||= join '', map {chr rand 256} 1..32;
-    $head->{'seed_key'}    ||= join '', map {chr rand 256} 1..32;
-    $head->{'seed_rot_n'}  ||= 6000;
-    $head->{'enc_iv'}      ||= join '', map {chr rand 256} 1..16;
     $head->{'0'}           ||= "\r\n\r\n";
     $head->{'protected_stream_key'} ||= join '', map {chr rand 256} 1..32;
     die "Missing start_bytes\n" if ! $head->{'start_bytes'};
-    die "Length of $_ was not 32\n" for grep {length($head->{$_}) != 32} qw(seed_rand seed_key protected_stream_key start_bytes);
+    die "Length of $_ was not 32 (".length($head->{$_}).")\n" for grep {length($head->{$_}) != 32} qw(seed_rand seed_key protected_stream_key start_bytes);
     die "Length of enc_iv was not 16\n" if length($head->{'enc_iv'}) != 16;
 
     my $buffer = pack 'L3', @$head{qw(sig1 sig2 ver)};
@@ -1082,6 +860,225 @@ sub _gen_v2_header {
     $pack->(10, pack('V', 2)); # salsa20 protection
     $pack->(0, $head->{'0'});
     return $buffer;
+}
+
+###----------------------------------------------------------------###
+
+sub slurp {
+    my ($self, $file) = @_;
+    open my $fh, '<', $file or die "Could not open $file: $!\n";
+    my $size = -s $file || die "File $file appears to be empty.\n";
+    read($fh, my $buffer, $size);
+    close $fh;
+    die "Could not read entire file contents of $file.\n" if length($buffer) != $size;
+    return $buffer;
+}
+
+sub decrypt_rijndael_cbc {
+    my ($self, $buffer, $key, $enc_iv) = @_;
+    my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
+    $cipher->set_iv($enc_iv);
+    $buffer = $cipher->decrypt($buffer);
+    my $extra = ord(substr $buffer, -1, 1);
+    substr($buffer, length($buffer) - $extra, $extra, '');
+    return $buffer;
+}
+
+sub encrypt_rijndael_cbc {
+    my ($self, $buffer, $key, $enc_iv) = @_;
+    my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
+    $cipher->set_iv($enc_iv);
+    my $extra = (16 - length($buffer) % 16) || 16; # always pad so we can always trim
+    $buffer .= chr($extra) for 1 .. $extra;
+    return $cipher->encrypt($buffer);
+}
+
+sub unchunksum {
+    my ($self, $buffer) = @_;
+    my ($new, $pos) = ('', 0);
+    while ($pos < length($buffer)) {
+        my ($index, $hash, $size) = unpack "\@$pos L a32 i", $buffer;
+        $pos += 40;
+        if ($size == 0) {
+            warn "Found mismatch for 0 chunksize\n" if $hash !~ /^\x00{32}$/;
+            last;
+        }
+        #print "$index $hash $size\n";
+        my $chunk = substr $buffer, $pos, $size;
+        die "Chunk hash of index $index did not match\n" if $hash ne sha256($chunk);
+        $pos += $size;
+        $new .= $chunk;
+    }
+    return $new;
+}
+
+sub chunksum {
+    my ($self, $buffer) = @_;
+    my $new;
+    my $index = 0;
+    my $chunk_size = 8192;
+    my $pos = 0;
+    while ($pos < length($buffer)) {
+        my $chunk = substr($buffer, $pos, $chunk_size);
+        $new .= pack("L a32 i", $index++, sha256($chunk), length($chunk));
+        $new .= $chunk;
+        $pos += length($chunk);
+    }
+    return $new;
+}
+
+sub decompress {
+    my ($self, $buffer) = @_;
+    eval { require Compress::Raw::Zlib } or die "Cannot load compression library to decompress database: $@";
+    my ($i, $status) = Compress::Raw::Zlib::Inflate->new(-WindowBits => 31);
+    die "Failed to initialize inflator ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
+    $status = $i->inflate($buffer, my $out);
+    die "Failed to uncompress buffer ($status)\n" if $status != Compress::Raw::Zlib::Z_STREAM_END();
+    return $out;
+}
+
+sub compress {
+    my ($self, $buffer) = @_;
+    eval { require Compress::Raw::Zlib } or die "Cannot load compression library to compress database: $@";
+    my ($d, $status) = Compress::Raw::Zlib::Deflate->new(-WindowBits => 31, -AppendOutput => 1);
+    die "Failed to initialize inflator ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
+    $status = $d->deflate($buffer, my $out);
+    die "Failed to compress buffer ($status)\n" if $status != Compress::Raw::Zlib::Z_OK();
+    $status = $d->flush($out);
+    die "Failed to compress buffer ($status).\n" if $status != Compress::Raw::Zlib::Z_OK();
+    return $out;
+}
+
+sub decode_base64 {
+    my ($self, $content) = @_;
+    eval { require MIME::Base64 } or die "Cannot load Base64 library to decode item: $@";
+    return MIME::Base64::decode_base64($content);
+}
+
+sub encode_base64 {
+    my ($self, $content) = @_;
+    eval { require MIME::Base64 } or die "Cannot load Base64 library to encode item: $@";
+    ($content = MIME::Base64::encode_base64($content)) =~ s/\n//g;
+    return $content;
+}
+
+sub parse_xml {
+    my ($self, $buffer, $args) = @_;
+    eval { require XML::Parser } or die "Cannot load XML library to parse database: $@";
+    my $top = $args->{'top'};
+    my $force_array = $args->{'force_array'} || {};
+    my $s_handlers  = $args->{'start_handlers'} || {};
+    my $e_handlers  = $args->{'end_handlers'}   || $args->{'handlers'} || {};
+    my $data;
+    my $ptr;
+    my $x = XML::Parser->new(Handlers => {
+        Start => sub {
+            my ($x, $tag, %attr) = @_; # loses multiple values of duplicately named attrs
+            my $prev_ptr = $ptr;
+            $top = $tag if !defined $top;
+            if ($tag eq $top) {
+                die "The $top tag should only be used at the top level.\n" if $ptr || $data;
+                $ptr = $data = {};
+            } elsif (exists($prev_ptr->{$tag})  || ($force_array->{$tag} and $prev_ptr->{$tag} ||= [])) {
+                $prev_ptr->{$tag} = [$prev_ptr->{$tag}] if 'ARRAY' ne ref $prev_ptr->{$tag};
+                push @{ $prev_ptr->{$tag} }, ($ptr = {});
+            } else {
+                $ptr = $prev_ptr->{$tag} ||= {};
+            }
+            @$ptr{keys %attr} = values %attr;
+            $_->($ptr, $prev_ptr, $prev_ptr->{'__tag__'}, $tag) if $_ = $s_handlers->{$tag} || $s_handlers->{'__any__'};
+            @$ptr{qw(__parent__ __tag__)} = ($prev_ptr, $tag);
+        },
+        End => sub {
+            my ($x, $tag) = @_;
+            my $cur_ptr = $ptr;
+            $ptr = delete $cur_ptr->{'__parent__'};
+            die "End tag mismatch on $tag.\n" if $tag ne delete($cur_ptr->{'__tag__'});
+            my $n_keys = scalar keys %$cur_ptr;
+            if (!$n_keys) {
+                $ptr->{$tag} = ''; # SuppressEmpty
+            } elsif (exists $cur_ptr->{'content'}) {
+                if ($n_keys == 1) {
+                    if ($ptr->{$tag} eq 'ARRAY') {
+                        $ptr->{$tag}->[-1] = $cur_ptr->{'content'};
+                    } else {
+                        $ptr->{$tag} = $cur_ptr->{'content'};
+                    }
+                } elsif ($cur_ptr->{'content'} !~ /\S/) {
+                    delete $cur_ptr->{'content'};
+                }
+            }
+            $_->($cur_ptr, $ptr, $ptr->{'__tag__'}, $tag) if $_ = $e_handlers->{$tag} || $e_handlers->{'__any__'};
+        },
+        Char => sub { if (defined $ptr->{'content'}) { $ptr->{'content'} .= $_[1] } else { $ptr->{'content'} = $_[1] } },
+    });
+    $x->parse($buffer);
+    return $data;
+}
+
+sub gen_xml {
+    my ($self, $ref, $args) = @_;
+    my $indent = !$args->{'indent'} ? '' : $args->{'indent'} eq "1" ? "  " : $args->{'indent'};
+    my $level = 0;
+    my $top = $args->{'top'} || 'root';
+    my $xml = $args->{'declaration'} || '';
+    $xml .= "\n" . ($indent x $level) if $xml && $indent;
+    $xml .= "<$top>";
+    my $rec; $rec = sub {
+        $level++;
+        my ($ref, $tag) = @_;
+        my $n = 0;
+        my $order = delete($ref->{'__sort__'}) || $args->{'sort'}->{$tag} || [sort grep {$_ ne '__attr__'} keys %$ref];
+        for my $key (@$order) {
+            next if ! exists $ref->{$key};
+            for my $node (ref($ref->{$key}) eq 'ARRAY' ? @{ $ref->{$key} } : $ref->{$key}) {
+                $n++;
+                $xml .= "\n" . ($indent x $level) if $indent;
+                if (!ref $node) {
+                    $xml .= (!defined($node) || !length($node)) ? "<$key />" : "<$key>".$self->escape_xml($node)."</$key>";
+                    next;
+                }
+                if ($node->{'__attr__'} || exists($node->{'content'})) {
+                    $xml .= "<$key".join('', map {" $_=\"".$self->escape_xml($node->{$_})."\""} @{$node->{'__attr__'}||[sort grep {$_ ne 'content'} keys %$node]}).">";
+                } else {
+                    $xml .= "<$key>";
+                }
+                if (exists $node->{'content'}) {
+                    if (defined($node->{'content'}) && length $node->{'content'}) {
+                        $xml .= $self->escape_xml($node->{'content'}) . "</$key>";
+                    } else {
+                        $xml =~ s|(>\s*)$| /$1|;
+                    }
+                    next;
+                }
+                if ($rec->($node, $key)) {
+                    $xml .= "\n" . ($indent x $level) if $indent;
+                    $xml .= "</$key>";
+                } else {
+                    $xml =~ s|(>\s*)$| /$1|;
+                }
+            }
+        }
+        $level--;
+        return $n;
+    };
+    $rec->($ref, $top);
+    $xml .= "\n" . ($indent x $level) if $indent;
+    $xml .= "</$top>";
+    $xml .= "\n" if $indent && ! $args->{'no_trailing_newline'};
+    return $xml;
+}
+
+sub escape_xml {
+    my $self = shift;
+    local $_ = shift;
+    return '' if ! defined;
+    s/&/&amp;/g;
+    s/</&lt;/g;
+    s/>/&gt;/g;
+    s/"/&quot;/g;
+    s/([^\x00-\x7F])/'&#'.(ord $1).';'/ge;
+    return $_;
 }
 
 ###----------------------------------------------------------------###
@@ -1123,14 +1120,14 @@ sub finder_tests {
     my @tests;
     foreach my $key (keys %{ $args || {} }) {
         next if ! defined $args->{$key};
-        my ($field, $op) = ($key =~ m{ ^ (\w+) \s* (|!|=|!~|=~|gt|lt) $ }x) ? ($1, $2) : croak "Invalid find match criteria \"$key\"";
+        my ($field, $op) = ($key =~ m{ ^ (\w+) \s* (|!|=|!~|=~|gt|lt) $ }x) ? ($1, $2) : die "Invalid find match criteria \"$key\"\n";
         push @tests,  (!$op || $op eq '=') ? sub {  defined($_[0]->{$field}) && $_[0]->{$field} eq $args->{$key} }
                     : ($op eq '!')         ? sub { !defined($_[0]->{$field}) || $_[0]->{$field} ne $args->{$key} }
                     : ($op eq '=~')        ? sub {  defined($_[0]->{$field}) && $_[0]->{$field} =~ $args->{$key} }
                     : ($op eq '!~')        ? sub { !defined($_[0]->{$field}) || $_[0]->{$field} !~ $args->{$key} }
                     : ($op eq 'gt')        ? sub {  defined($_[0]->{$field}) && $_[0]->{$field} gt $args->{$key} }
                     : ($op eq 'lt')        ? sub {  defined($_[0]->{$field}) && $_[0]->{$field} lt $args->{$key} }
-                    : croak;
+                    : die "Unknown op \"$op\"\n";
     }
     return @tests;
 }
@@ -1162,7 +1159,7 @@ sub find_group {
     my $self = shift;
     local $self->{'__group_groups'} = [] if wantarray;
     my @g = $self->find_groups(@_);
-    croak "Found too many groups (@g)" if @g > 1;
+    die "Found too many groups (@g)\n" if @g > 1;
     return wantarray ? ($g[0], $self->{'__group_groups'}->[0]) : $g[0];
 }
 
@@ -1183,11 +1180,11 @@ sub delete_group {
 sub add_entry {
     my ($self, $args, $groups) = @_;
     $groups ||= $self->groups;
-    croak "You must unlock the passwords before adding new entries.\n" if $self->is_locked($groups);
+    die "You must unlock the passwords before adding new entries.\n" if $self->is_locked($groups);
     $args = {%$args};
     my $group = delete($args->{'group'}) || $groups->[0] || $self->add_group({});
     if (! ref($group)) {
-        $group = $self->find_group({id => $group}, $groups) || croak "Could not find a matching group to add entry to";
+        $group = $self->find_group({id => $group}, $groups) || die "Could not find a matching group to add entry to.\n";
     }
 
     $args->{$_} = ''         for grep {!defined $args->{$_}} qw(title url username password comment bin_desc binary);
@@ -1224,7 +1221,7 @@ sub find_entry {
     my $self = shift;
     local $self->{'__entry_groups'} = [] if wantarray;
     my @e = $self->find_entries(@_);
-    croak "Found too many entries (@e)" if @e > 1;
+    die "Found too many entries (@e)\n" if @e > 1;
     return wantarray ? ($e[0], $self->{'__entry_groups'}->[0]) : $e[0];
 }
 
@@ -1294,7 +1291,7 @@ sub locked_entry_password {
     my $self = shift;
     my $entry = shift;
     my $groups = shift || $self->groups;
-    my $ref = $locker{"$groups"} || croak "Passwords aren't locked";
+    my $ref = $locker{"$groups"} || die "Passwords are not locked\n";
     $entry = $self->find_entry({id => $entry}, $groups) if ! ref $entry;
     return if ! $entry;
     my $pass = $ref->{"$entry"};
@@ -1470,6 +1467,17 @@ __END__
 
     # save out a version 1 database using a password and key file
     $k->save_db("/some/file/location.kdb", [$master_pass, $key_filename]);
+
+
+    # read database from a file
+    $k->parse_db($pass_db_string, $pass);
+
+    # generate a keepass version 1 database string
+    my $pass_db_string = $k->gen_db($pass);
+
+    # generate a keepass version 2 database string
+    my $pass_db_string = $k->gen_db($pass);
+
 
 =head1 DESCRIPTION
 
