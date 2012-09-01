@@ -547,6 +547,7 @@ sub gen_db {
     my ($self, $pass, $head, $groups) = @_;
     $head ||= {};
     $groups ||= $self->groups;
+    local $self->{'keep_xml'} = $head->{'keep_xml'} if exists $head->{'keep_xml'};
     my $v = $head->{'version'} || $self->{'version'};
     my $reuse = $head->{'reuse_header'}                        # explicit yes
                 || (!exists($head->{'reuse_header'})           # not explicit no
