@@ -22,6 +22,7 @@ use constant DB_FLAG_TWOFISH  => 8;
 our $VERSION = '0.03';
 my %locker;
 my $salsa20_iv = "\xe8\x30\x09\x4b\x97\x20\x5d\x2a";
+my $qr_date = qr/^(\d\d\d\d)-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(\.\d+|)?Z?$/;
 
 sub new {
     my $class = shift;
@@ -37,9 +38,7 @@ sub auto_lock {
 
 sub groups { shift->{'groups'} || die "No groups loaded yet\n" }
 
-sub header { shift->{'header'} || die "No header loaded yet\n" }
-
-sub meta { shift->{'meta'} || die "No meta information loaded yet\n" }
+sub header { shift->{'header'} }
 
 ###----------------------------------------------------------------###
 
@@ -54,18 +53,15 @@ sub load_db {
 }
 
 sub save_db {
-    my ($self, $file, $pass, $args, $meta, $groups) = @_;
-    $args   ||= $self->{'reuse_header'} ? $self->header : {};
-    $meta   ||= eval { $self->meta } || {};
-    $groups ||= $self->groups;
+    my ($self, $file, $pass, $head, $groups) = @_;
     die "Missing file\n" if ! $file;
-    local $args->{'version'} = $args->{'version'}  ? $args->{'version'}
-                             : $file =~ /\.kdbx$/i ? 2
-                             : $file =~ /\.kdb$/i  ? 1
-                             : $self->{'header'}   ? $self->{'header'}->{'header'}
-                             : $self->{'version'};
+    $head ||= {};
+    my $v = $file =~ /\.kdbx$/i ? 2
+          : $file =~ /\.kdb$/i  ? 1
+          : $head->{'version'} || $self->{'version'};
+    $head->{'version'} = $v;
 
-    my $buf = $self->gen_db($pass, $args, $meta, $groups);
+    my $buf = $self->gen_db($pass, $head, $groups);
     my $bak = "$file.bak";
     my $tmp = "$file.new.".int(time());
     open my $fh, '>', $tmp or die "Could not open $tmp: $!\n";
@@ -94,7 +90,7 @@ sub save_db {
 sub clear {
     my $self = shift;
     $self->unlock if $self->{'groups'};
-    delete @$self{qw(header meta groups)};
+    delete @$self{qw(header groups)};
 }
 
 sub DESTROY { shift->clear }
@@ -110,12 +106,11 @@ sub parse_db {
 
     $self->unlock if $self->{'groups'}; # make sure we don't leave dangling keys should we reopen a new db
 
-    $self->{'header'} = $head;
-
     my $meth = ($head->{'version'} == 1) ? '_parse_v1_body'
              : ($head->{'version'} == 2) ? '_parse_v2_body'
              : die "Unsupported keepass database version ($head->{'version'})\n";
-    @$self{qw(meta groups)} = $self->$meth($buffer, $pass, $head);
+    (my $meta, $self->{'groups'}) = $self->$meth($buffer, $pass, $head);
+    $self->{'header'} = {%$head, %$meta};
 
     $self->lock if $self->auto_lock;
     return $self;
@@ -198,36 +193,6 @@ sub _parse_v2_header {
 
     $h{'header_size'} = $pos;
     return \%h;
-}
-
-###----------------------------------------------------------------###
-
-sub _master_key {
-    my ($self, $pass, $head) = @_;
-    my $file;
-    ($pass, $file) = @$pass if ref($pass) eq 'ARRAY';
-    $pass = sha256($pass) if defined($pass) && length($pass);
-    if ($file) {
-        $file = $self->slurp($file);
-        if (length($file) == 64) {
-            $file = join '', map {chr hex} ($file =~ /\G([a-f0-9A-F]{2})/g);
-        } elsif (length($file) != 32) {
-            $file = sha256($file);
-        }
-    }
-    my $key = (!$pass && !$file) ? die "One or both of password or key file must be passed\n"
-            : ($head->{'version'} && $head->{'version'} eq '2') ? sha256(grep {$_} $pass, $file)
-            : ($pass && $file) ? sha256($pass, $file) : $pass ? $pass : $file;
-    $head->{'enc_iv'}     ||= join '', map {chr rand 256} 1..16;
-    $head->{'seed_rand'}  ||= join '', map {chr rand 256} 1..($head->{'version'} && $head->{'version'} eq '2' ? 32 : 16);
-    $head->{'seed_key'}   ||= sha256(time.rand().$$);
-    $head->{'seed_rot_n'} ||= $self->{'seed_rot_n'} || 50_000;
-
-    my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
-    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
-    $key = sha256($key);
-    $key = sha256($head->{'seed_rand'}, $key);
-    return $key;
 }
 
 sub _parse_v1_body {
@@ -395,8 +360,6 @@ sub _parse_v2_body {
     return ($META, \@GROUPS);
 }
 
-###----------------------------------------------------------------###
-
 sub _parse_v1_groups {
     my ($self, $buffer, $n_groups) = @_;
     my $pos = 0;
@@ -547,30 +510,65 @@ sub _parse_v1_date {
 
 sub _parse_v2_date {
     my ($self, $date) = @_;
-    return ($date && $date =~ /^(\d\d\d\d-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)Z?$/) ? "$1 $2" : '';
+    return ($date && $date =~ $qr_date) ? "$1-$2-$3 $4:$5:$6$7" : '';
+}
+
+sub _master_key {
+    my ($self, $pass, $head) = @_;
+    my $file;
+    ($pass, $file) = @$pass if ref($pass) eq 'ARRAY';
+    $pass = sha256($pass) if defined($pass) && length($pass);
+    if ($file) {
+        $file = $self->slurp($file);
+        if (length($file) == 64) {
+            $file = join '', map {chr hex} ($file =~ /\G([a-f0-9A-F]{2})/g);
+        } elsif (length($file) != 32) {
+            $file = sha256($file);
+        }
+    }
+    my $key = (!$pass && !$file) ? die "One or both of password or key file must be passed\n"
+            : ($head->{'version'} && $head->{'version'} eq '2') ? sha256(grep {$_} $pass, $file)
+            : ($pass && $file) ? sha256($pass, $file) : $pass ? $pass : $file;
+    $head->{'enc_iv'}     ||= join '', map {chr rand 256} 1..16;
+    $head->{'seed_rand'}  ||= join '', map {chr rand 256} 1..($head->{'version'} && $head->{'version'} eq '2' ? 32 : 16);
+    $head->{'seed_key'}   ||= sha256(time.rand().$$);
+    $head->{'seed_rot_n'} ||= $self->{'seed_rot_n'} || 50_000;
+
+    my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
+    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
+    $key = sha256($key);
+    $key = sha256($head->{'seed_rand'}, $key);
+    return $key;
 }
 
 ###----------------------------------------------------------------###
 
 sub gen_db {
-    my ($self, $pass, $head, $meta, $groups) = @_;
-    $head   ||= $self->{'reuse_header'} ? $self->header : {};
-    $meta   ||= eval { $self->meta } || {};
+    my ($self, $pass, $head, $groups) = @_;
+    $head ||= {};
     $groups ||= $self->groups;
+    my $v = $head->{'version'} || $self->{'version'};
+    my $reuse = $head->{'reuse_header'}                        # explicit yes
+                || (!exists($head->{'reuse_header'})           # not explicit no
+                    && ($self->{'reuse_header'}                # explicit yes
+                        || !exists($self->{'reuse_header'}))); # not explicit no
+    $head = $self->header if $reuse;
+    $head->{'version'} = $v ||= $head->{'version'} || '1';
+    delete @$head{qw(enc_iv seed_key seed_rand protected_stream_key start_bytes)} if $reuse && $reuse < 0;
+
     die "Missing pass\n" if ! defined($pass);
     die "Please unlock before calling gen_db\n" if $self->is_locked($groups);
 
     srand((time() ^ $$) * rand()) if ! $self->{'no_srand'};
-    if (($head->{'version'} || $self->{'version'} || '') eq '2') {
-        $head->{'version'} = '2';
-        return $self->_gen_v2_db($pass, $head, $meta, $groups);
+    if ($v eq '2') {
+        return $self->_gen_v2_db($pass, $head, $groups);
     } else {
-        return $self->_gen_v1_db($pass, $head, $meta, $groups);
+        return $self->_gen_v1_db($pass, $head, $groups);
     }
 }
 
 sub _gen_v1_db {
-    my ($self, $pass, $head, $meta, $groups) = @_;
+    my ($self, $pass, $head, $groups) = @_;
     my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
     my $entries = '';
@@ -588,6 +586,7 @@ sub _gen_v1_db {
         $e->{'binary'} = pack 'L', scalar(@g);
         $e->{'binary'} .= pack('LC', $_->{'id'}, $_->{'expanded'} ? 1 : 0) for @g;
     }
+    $head->{'n_groups'} = $head->{'n_entries'} = 0;
     foreach my $g (@g) {
         $head->{'n_groups'}++;
         my @d = ([1,      pack('LL', 4, $g->{'id'})],
@@ -640,14 +639,6 @@ sub _gen_v1_header {
     my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
     my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
     my $header = pack $t, @$head{@f};
-    #my $header = ''
-    #    .pack('L4', @{ $head }{qw(sig1 sig2 flags ver)})
-    #    .$head->{'seed_rand'}
-    #    .$head->{'enc_iv'}
-    #    .pack('L2', @{ $head }{qw(n_groups n_entries)})
-    #    .$head->{'checksum'}
-    #    .$head->{'seed_key'}
-    #    .pack('L', $head->{'seed_rot_n'});
     die "Invalid generated header\n" if length($header) != DB_HEADSIZE_V1;
     return $header;
 }
@@ -666,40 +657,63 @@ sub _gen_v1_date {
 }
 
 sub _gen_v2_db {
-    my ($self, $pass, $head, $meta, $groups) = @_;
+    my ($self, $pass, $head, $groups) = @_;
     my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
 
     my $untri = sub { return !defined($_[0]) ? 'null' : !$_[0] ? 'False' : 'True' };
 
-    my %META;
-    for my $key (keys %$meta) {
-        (my $copy = "\u\L$key") =~ s/(?:^|_)([a-z])/\u$1/g;
-        $copy =~ s/Uuid/UUID/;
-        next if $copy eq 'Binaries';
-        $META{$copy} = ($copy =~ /Changed$/) ? $self->_gen_v2_date($meta->{$key}) : $meta->{$key};
+    my @mfld = qw(Generator DatabaseName DatabaseNameChanged DatabaseDescription DatabaseDescriptionChanged DefaultUserName DefaultUserNameChanged
+                        MaintenanceHistoryDays Color MasterKeyChanged MasterKeyChangeRec MasterKeyChangeForce MemoryProtection
+                        RecycleBinEnabled RecycleBinUUID RecycleBinChanged EntryTemplatesGroup EntryTemplatesGroupChanged HistoryMaxItems HistoryMaxSize
+                        LastSelectedGroup LastTopVisibleGroup Binaries CustomData);
+    my $META = {__sort__ => \@mfld};
+    for my $key (@mfld) {
+        (my $copy = $key) =~ s/([a-z])([A-Z])/${1}_${2}/g;
+        $META->{$key} = $head->{lc $copy};
     }
-    $META{'RecycleBinEnabled'} = $untri->(exists($META{'RecycleBinEnabled'}) ? $META{'RecycleBinEnabled'} : 1);
-    my $p = $META{'MemoryProtection'} ||= {};
+    my $def = sub {
+        my ($k, $d, $r) = @_;
+        $META->{$k} = $d if !defined($META->{$k}) || ($r and $META->{$k} !~ $r);
+        $META->{$k} = $self->_gen_v2_date($META->{$k}) if $k =~ /Changed$/;
+    };
+    my $now = $self->_gen_v2_date;
+    $def->(Color                      => '');
+    $def->(CustomData                 => {});
+    $def->(DatabaseDescription        => '');
+    $def->(DatabaseDescriptionChanged => $now, $qr_date);
+    $def->(DatabaseName               => '');
+    $def->(DatabaseNameChanged        => $now, $qr_date);
+    $def->(DefaultUserName            => '');
+    $def->(DefaultUserNameChanged     => $now, $qr_date);
+    $def->(EntryTemplatesGroup        => '');
+    $def->(EntryTemplatesGroupChanged => $now, $qr_date);
+    $def->(Generator                  => ref($self));
+    $def->(HistoryMaxItems            => 10, qr{^\d+$});
+    $def->(HistoryMaxSize             => 6291456, qr{^\d+$});
+    $def->(LastSelectedGroup          => '');
+    $def->(LastTopVisibleGroup        => '');
+    $def->(MaintenanceHistoryDays     => 365, qr{^\d+$});
+    $def->(MasterKeyChangeForce       => -1);
+    $def->(MasterKeyChangeRec         => -1);
+    $def->(MasterKeyChanged           => $now, $qr_date);
+    $def->(RecycleBinChanged          => $now, $qr_date);
+    $def->(RecycleBinUUID             => '');
+    $META->{'RecycleBinEnabled'}      = $untri->(exists($META->{'RecycleBinEnabled'}) ? $META->{'RecycleBinEnabled'} : 1);
+    my $p = $META->{'MemoryProtection'} ||= {};
     $p->{'password'} = 1 if ! exists $p->{'password'};
-    for my $key (qw(title username password url notes), sort keys %$p) {
-        my $new = lc($key) eq 'username' ? 'UserName' : lc($key) eq 'url' ? 'URL' : $key;
-        $new = "Protect\u$new";
-        next if exists $p->{$new};
-        $p->{$new} = (exists($p->{$key}) ? delete($p->{$key}) : ($key eq 'password')) ? 'True' : 'False';
+    for my $key (qw(Title UserName Password URL Notes)) {
+        my $new = "Protect$key";
         push @{$p->{'__sort__'}}, $new;
-    } # TODO
-    $META{'__sort__'} = [qw(Generator DatabaseName DatabaseNameChanged DatabaseDescription DatabaseDescriptionChanged DefaultUserName DefaultUserNameChanged
-                            MaintenanceHistoryDays Color MasterKeyChanged MasterKeyChangeRec MasterKeyChangeForce MemoryProtection
-                            RecycleBinEnabled RecycleBinUUID RecycleBinChanged EntryTemplatesGroup EntryTemplatesGroupChanged HistoryMaxItems HistoryMaxSize
-                            LastSelectedGroup LastTopVisibleGroup Binaries CustomData)];
+        $p->{$new} = (exists($p->{lc $key}) ? delete($p->{lc $key}) : ($key eq 'Password')) ? 'True' : 'False';
+    }
 
     my @GROUPS;
-    my $BIN = $META{'Binaries'}->{'Binary'} = [];
+    my $BIN = $META->{'Binaries'}->{'Binary'} = [];
     my @PROTECT_BIN;
     my @PROTECT_STR;
     my $data = {
-        Meta => \%META,
+        Meta => $META,
         Root => {
             __sort__ => [qw(Group DeletedObjects)],
             Group => \@GROUPS,
@@ -737,7 +751,7 @@ sub _gen_v2_db {
                 Key => $key,
                 Value => $val,
             };
-            if (($META{'MemoryProtection'}->{"Protect${key}"} || '') eq 'True' || $e->{'v2_extra'}->{'protected'}->{$key}) {
+            if (($META->{'MemoryProtection'}->{"Protect${key}"} || '') eq 'True' || $e->{'v2_extra'}->{'protected'}->{$key}) {
                 $s->{'Value'} = {Protected => 'True', content => $val};
                 push @PROTECT_STR, \$s->{'Value'}->{'content'} if length $s->{'Value'}->{'content'};
             }
@@ -829,7 +843,7 @@ sub _gen_v2_db {
 sub _gen_v2_date {
     my ($self, $date) = @_;
     $date = $self->now($date) if !$date || $date =~ /^\d+$/;
-    my ($year, $mon, $day, $hour, $min, $sec) = $date =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/ ? ($1,$2,$3,$4,$5,$6) : die "Invalid date ($date)";
+    my ($year, $mon, $day, $hour, $min, $sec) = $date =~ $qr_date ? ($1,$2,$3,$4,$5,$6) : die "Invalid date ($date)";
     return "${year}-${mon}-${day}T${hour}:${min}:${sec}Z";
 }
 
@@ -1406,13 +1420,14 @@ __END__
 =head1 SYNOPSIS
 
     use File::KeePass;
+    use Data::Dumper qw(Dumper);
 
     my $k = File::KeePass->new;
 
     # read a version 1 or version 2 database
     $k->load_db($file, $master_pass); # errors die
 
-    use Data::Dumper qw(Dumper);
+    print Dumper $k->header;
     print Dumper $k->groups; # passwords are locked
 
     $k->unlock;
@@ -1588,6 +1603,72 @@ method if the database is currently locked.
 
 The same master password types passed to load_db can be used here.
 
+=item header
+
+Returns a hashref representing the combined current header and meta
+information for the currently loaded database.
+
+The following fields are present in both version 1 and version 2
+style databases (from the header):
+
+    enc_iv               => "123456789123456", # rand
+    enc_type             => "rijndael",
+    header_size          => 222,
+    seed_key             => "1234567890123456", # rand (32 bytes on v2)
+    seed_rand            => "12345678901234567890123456789012", # rand
+    seed_rot_n           => 6000,
+    sig1                 => "2594363651",
+    sig2                 => "3041655655", # indicates db version
+    ver                  => 196608,
+    version              => 1, # or 2
+
+The following keys will be present after the reading of a version 2
+database (from the header):
+
+    cipher               => "aes",
+    compression          => 1,
+    protected_stream     => "salsa20",
+    protected_stream_key => "12345678901234567890123456789012", # rand
+    start_bytes          => "12345678901234567890123456789012", # rand
+
+Additionally, items parsed from the Meta section of a version 2
+database will be added.  The following are the available fields.
+
+    color                         => "#4FFF00",
+    custom_data                   => {key1 => "val1"},
+    database_description          => "database desc",
+    database_description_changed  => "2012-08-17 00:30:56",
+    database_name                 => "database name",
+    database_name_changed         => "2012-08-17 00:30:56",
+    default_user_name             => "",
+    default_user_name_changed     => "2012-08-17 00:30:34",
+    entry_templates_group         => "VL5nOpzlFUevGhqL71/OTA==",
+    entry_templates_group_changed => "2012-08-21 14:05:32",
+    generator                     => "KeePass",
+    history_max_items             => 10,
+    history_max_size              => 6291456, # bytes
+    last_selected_group           => "SUgL30QQqUK3tOWuNKUYJA==",
+    last_top_visible_group        => "dC1sQ1NO80W7klmRhfEUVw==",
+    maintenance_history_days      => 365,
+    master_key_change_force       => -1,
+    master_key_change_rec         => -1,
+    master_key_changed            => "2012-08-17 00:30:34",
+    memory_protection             => {
+        notes    => 0,
+        password => 1,
+        title    => 0,
+        url      => 0,
+        username => 0
+    },
+    recycle_bin_changed           => "2012-08-17 00:30:34",
+    recycle_bin_enabled           => 1,
+    recycle_bin_uuid              => "SUgL30QQqUK3tOWuNKUYJA=="
+
+When writing a database via either save_db or gen_db, these
+fields can be set and passed along.  Optionally, it is possible
+to pass along a key called reuse_header to let calls to save_db
+and gen_db automatically use the contents of the previous header.
+
 =item clear
 
 Clears any currently loaded database.
@@ -1672,67 +1753,6 @@ Groups will look similar to the following:
              title    => "Bar"
          }],
      }];
-
-=item header
-
-Returns the current loaded db header.  Some fields such as cipher,
-compression, protected_stream, protected_stream_key, and start_bytes
-only apply to version 2 databases.
-
-    header => {
-        cipher               => "aes",
-        compression          => 1,
-        enc_iv               => "123456789123456", # rand
-        enc_type             => "rijndael",
-        header_size          => 222,
-        protected_stream     => "salsa20",
-        protected_stream_key => "12345678901234567890123456789012", # rand
-        seed_key             => "12345678901234567890123456789012", # rand
-        seed_rand            => "12345678901234567890123456789012", # rand
-        seed_rot_n           => 6000,
-        sig1                 => "2594363651",
-        sig2                 => "3041655655",
-        start_bytes          => "12345678901234567890123456789012", # rand
-        ver                  => 196608,
-        version              => 2,
-    },
-
-=item meta
-
-Returns the current loaded db meta information.  Will be empty
-on a version 1 database.
-
-    meta => {
-        color                         => "#4FFF00",
-        custom_data                   => {key1 => "val1"},
-        database_description          => "database desc",
-        database_description_changed  => "2012-08-17 00:30:56",
-        database_name                 => "database name",
-        database_name_changed         => "2012-08-17 00:30:56",
-        default_user_name             => "",
-        default_user_name_changed     => "2012-08-17 00:30:34",
-        entry_templates_group         => "VL5nOpzlFUevGhqL71/OTA==",
-        entry_templates_group_changed => "2012-08-21 14:05:32",
-        generator                     => "KeePass",
-        history_max_items             => 10,
-        history_max_size              => 6291456, # bytes
-        last_selected_group           => "SUgL30QQqUK3tOWuNKUYJA==",
-        last_top_visible_group        => "dC1sQ1NO80W7klmRhfEUVw==",
-        maintenance_history_days      => 365,
-        master_key_change_force       => -1,
-        master_key_change_rec         => -1,
-        master_key_changed            => "2012-08-17 00:30:34",
-        memory_protection             => {
-            notes    => 0,
-            password => 1,
-            title    => 0,
-            url      => 0,
-            username => 0
-        },
-        recycle_bin_changed           => "2012-08-17 00:30:34",
-        recycle_bin_enabled           => 1,
-        recycle_bin_uuid              => "SUgL30QQqUK3tOWuNKUYJA=="
-    },
 
 =item add_group
 
