@@ -237,6 +237,8 @@ sub _parse_v2_body {
                 my ($node, $parent) = @_;
                 die "Found multiple intances of Meta.\n" if $META;
                 $META = {};
+                my $pro = delete($node->{'MemoryProtection'}) || {}; # flatten out protection
+                @$node{map {s/Protect/protect_/; lc $_} keys %$pro} = map {$tri->($_)} values %$pro;
                 for my $key (keys %$node) {
                     next if $key eq 'Binaries';
                     (my $copy = $key) =~ s/([a-z])([A-Z])/${1}_${2}/g;
@@ -259,12 +261,6 @@ sub _parse_v2_body {
                     $key = do { warn "Missing key for binary."; 'unknown' } if ! defined $key;
                     warn "Duplicate binary key for entry." if $parent->{'__binary__'}->{$key};
                     $parent->{'__binary__'}->{$key} = $BIN{$node->{'Value'}->{'Ref'}};
-                }
-            },
-            MemoryProtection => sub {
-                my $node = shift;
-                for my $key (keys %$node) {
-                    $node->{lc $1} = delete($node->{$key}) eq 'True' ? 1 : 0 if $key =~ /^Protect(\w+)$/;
                 }
             },
             CustomData => sub {
@@ -702,11 +698,10 @@ sub _gen_v2_db {
     $def->(RecycleBinUUID             => '');
     $META->{'RecycleBinEnabled'}      = $untri->(exists($META->{'RecycleBinEnabled'}) ? $META->{'RecycleBinEnabled'} : 1);
     my $p = $META->{'MemoryProtection'} ||= {};
-    $p->{'password'} = 1 if ! exists $p->{'password'};
-    for my $key (qw(Title UserName Password URL Notes)) {
-        my $new = "Protect$key";
+    for my $new (qw(ProtectTitle ProtectUserName ProtectPassword ProtectURL ProtectNotes)) { # unflatten protection
+        (my $key = lc $new) =~ s/protect/protect_/;
         push @{$p->{'__sort__'}}, $new;
-        $p->{$new} = (exists($p->{lc $key}) ? delete($p->{lc $key}) : ($key eq 'Password')) ? 'True' : 'False';
+        $p->{$new} = (exists($META->{$key}) ? delete($META->{$key}) : ($key eq 'protect_password')) ? 'True' : 'False';
     }
 
     my @GROUPS;
@@ -1654,13 +1649,11 @@ database will be added.  The following are the available fields.
     master_key_change_force       => -1,
     master_key_change_rec         => -1,
     master_key_changed            => "2012-08-17 00:30:34",
-    memory_protection             => {
-        notes    => 0,
-        password => 1,
-        title    => 0,
-        url      => 0,
-        username => 0
-    },
+    protect_notes                 => 0,
+    protect_password              => 1,
+    protect_title                 => 0,
+    protect_url                   => 0,
+    protect_username              => 0
     recycle_bin_changed           => "2012-08-17 00:30:34",
     recycle_bin_enabled           => 1,
     recycle_bin_uuid              => "SUgL30QQqUK3tOWuNKUYJA=="
