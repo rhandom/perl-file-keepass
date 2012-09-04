@@ -65,6 +65,7 @@ sub save_db {
     my $bak = "$file.bak";
     my $tmp = "$file.new.".int(time());
     open my $fh, '>', $tmp or die "Could not open $tmp: $!\n";
+    binmode $fh;
     print $fh $buf;
     close $fh;
     if (-s $tmp ne length($buf)) {
@@ -878,6 +879,7 @@ sub slurp {
     my ($self, $file) = @_;
     open my $fh, '<', $file or die "Could not open $file: $!\n";
     my $size = -s $file || die "File $file appears to be empty.\n";
+    binmode $fh;
     read($fh, my $buffer, $size);
     close $fh;
     die "Could not read entire file contents of $file.\n" if length($buffer) != $size;
