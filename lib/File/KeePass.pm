@@ -280,17 +280,17 @@ sub _parse_v2_body {
                     expires  => $self->_parse_v2_date($node->{'Times'}->{'ExpiryTime'}),
                     created  => $self->_parse_v2_date($node->{'Times'}->{'CreationTime'}),
                     modified => $self->_parse_v2_date($node->{'Times'}->{'LastModificationTime'}),
-                    v2_extra => {
-                        default_auto_type => $node->{'DefaultAutoTypeSequence'},
-                        enable_auto_type  => $tri->($node->{'EnableAutoType'}),
-                        enable_searching  => $tri->($node->{'EnableSearching'}),
-                        last_top_entry    => $node->{'LastTopVisibleEntry'},
-                        custom_icon_uuid  => $node->{'CustomIconUUID'},
-                        expires           => $tri->($node->{'Times'}->{'Expires'}),
-                        location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
-                        usage_count       => $node->{'Times'}->{'UsageCount'},
-                        notes             => $node->{'Notes'},
-                    },
+
+                    auto_type_default => $node->{'DefaultAutoTypeSequence'},
+                    auto_type_enabled => $tri->($node->{'EnableAutoType'}),
+                    enable_searching  => $tri->($node->{'EnableSearching'}),
+                    last_top_entry    => $node->{'LastTopVisibleEntry'},
+                    custom_icon_uuid  => $node->{'CustomIconUUID'},
+                    expires_enabled   => $tri->($node->{'Times'}->{'Expires'}),
+                    location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
+                    usage_count       => $node->{'Times'}->{'UsageCount'},
+                    notes             => $node->{'Notes'},
+
                     entries => delete($node->{'__entries__'}) || [],
                     groups  => delete($node->{'__groups__'})  || [],
                 };
@@ -320,21 +320,22 @@ sub _parse_v2_body {
                     url      => delete($str{'URL'}),
                     username => delete($str{'UserName'}),
                     password => delete($str{'Password'}),
-                    v2_extra => {
-                        expires           => $tri->($node->{'Times'}->{'Expires'}),
-                        location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
-                        usage_count       => $node->{'Times'}->{'UsageCount'},
-                        tags              => $node->{'Tags'},
-                        background_color  => $node->{'BackgroundColor'},
-                        foreground_color  => $node->{'ForegroundColor'},
-                        custom_icon_uuid  => $node->{'CustomIconUUID'},
-                        history           => $node->{'History'},
-                        override_url      => $node->{'OverrideURL'},
-                        auto_type         => $node->{'AutoType'},
-                        protected         => delete($str{'__protected__'}),
-                    },
+
+                    expires_enabled   => $tri->($node->{'Times'}->{'Expires'}),
+                    location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
+                    usage_count       => $node->{'Times'}->{'UsageCount'},
+                    tags              => $node->{'Tags'},
+                    background_color  => $node->{'BackgroundColor'},
+                    foreground_color  => $node->{'ForegroundColor'},
+                    custom_icon_uuid  => $node->{'CustomIconUUID'},
+                    history           => $node->{'History'},
+                    override_url      => $node->{'OverrideURL'},
+                    auto_type         => delete($node->{'AutoType'}->{'__auto_type__'}) || [],
+                    auto_type_enabled => $tri->($node->{'AutoType'}->{'Enabled'}),
+                    auto_type_munge   => $node->{'AutoType'}->{'DataTransferObfuscation'} ? 1 : 0,
+                    protected         => delete($str{'__protected__'}),
                 };
-                $entry->{'v2_extra'}->{'strings'} = \%str if scalar keys %str;
+                $entry->{'strings'} = \%str if scalar keys %str;
                 $entry->{'binary'} = delete($node->{'__binary__'}) if $node->{'__binary__'};
                 push @{ $parent->{'__entries__'} }, $entry;
             },
@@ -346,6 +347,10 @@ sub _parse_v2_body {
                     $node->{'Value'} = length($val) ? $s20_stream->($self->decode_base64($val)) : '';
                     $node->{'__protected__'} = 1;
                 }
+            },
+            Association => sub {
+                my ($node, $parent) = @_;
+                push @{ $parent->{'__auto_type__'} },  {window => $node->{'Window'}, keys => $node->{'KeystrokeSequence'}};
             },
             History => sub {
                 my ($node, $parent, $parent_tag, $tag) = @_;
@@ -726,32 +731,41 @@ sub _gen_v2_db {
             IconID => $e->{'icon'} || 0,
             Times  => {
                 __sort__             => [qw(LastModificationTime CreationTime LastAccessTime ExpiryTime Expires UsageCount LocationChanged)],
-                Expires              => $untri->($e->{'v2_extra'}->{'expires'}),
-                UsageCount           => $e->{'v2_extra'}->{'usage_count'} || 0,
+                Expires              => $untri->($e->{'expires_enabled'}),
+                UsageCount           => $e->{'usage_count'} || 0,
                 LastAccessTime       => $self->_gen_v2_date($e->{'accessed'}),
                 ExpiryTime           => $self->_gen_v2_date($e->{'expires'}),
                 CreationTime         => $self->_gen_v2_date($e->{'created'}),
                 LastModificationTime => $self->_gen_v2_date($e->{'modified'}),
-                LocationChanged      => $self->_gen_v2_date($e->{'v2_extra'}->{'location_changed'}),
+                LocationChanged      => $self->_gen_v2_date($e->{'location_changed'}),
             },
-            Tags            => $e->{'v2_extra'}->{'tags'},
-            BackgroundColor => $e->{'v2_extra'}->{'background_color'},
-            ForegroundColor => $e->{'v2_extra'}->{'foreground_color'},
-            CustomIconUUID  => $e->{'v2_extra'}->{'custom_icon_uuid'},
-            OverrideURL     => $e->{'v2_extra'}->{'override_url'},
-            AutoType        => $e->{'v2_extra'}->{'auto_type'},
+            Tags            => $e->{'tags'},
+            BackgroundColor => $e->{'background_color'},
+            ForegroundColor => $e->{'foreground_color'},
+            CustomIconUUID  => $e->{'custom_icon_uuid'},
+            OverrideURL     => $e->{'override_url'},
+            AutoType        => {
+                Enabled     => $untri->($e->{'auto_type_enabled'}),
+                DataTransferObfuscation => $e->{'auto_type_munge'} ? 1 : 0,
+            },
         };
-        foreach my $key (sort(keys %{ $e->{'v2_extra'}->{'strings'} || {} }), qw(Notes Password Title URL UserName)) {
-            my $val = ($key eq 'Notes') ? $e->{'comment'} : ($key=~/^(Password|Title|URL|UserName)$/) ? $e->{lc $key} : $e->{'v2_extra'}->{'strings'}->{$key};
+        foreach my $key (sort(keys %{ $e->{'strings'} || {} }), qw(Notes Password Title URL UserName)) {
+            my $val = ($key eq 'Notes') ? $e->{'comment'} : ($key=~/^(Password|Title|URL|UserName)$/) ? $e->{lc $key} : $e->{'strings'}->{$key};
             next if ! defined $val;
             push @{ $E->{'String'} }, my $s = {
                 Key => $key,
                 Value => $val,
             };
-            if (($META->{'MemoryProtection'}->{"Protect${key}"} || '') eq 'True' || $e->{'v2_extra'}->{'protected'}->{$key}) {
+            if (($META->{'MemoryProtection'}->{"Protect${key}"} || '') eq 'True' || $e->{'protected'}->{$key}) {
                 $s->{'Value'} = {Protected => 'True', content => $val};
                 push @PROTECT_STR, \$s->{'Value'}->{'content'} if length $s->{'Value'}->{'content'};
             }
+        }
+        foreach my $at (@{ $e->{'auto_type'} || [] }) {
+            push @{ $E->{'AutoType'}->{'Association'} }, {
+                Window => $at->{'window'},
+                KeystrokeSequence => $at->{'keys'},
+            };
         }
         my $bin = $e->{'binary'} || {}; $bin = {__anon__ => $bin} if ref($bin) ne 'HASH';
         splice @{ $E->{'__sort__'} }, -2, 0, 'Binary' if scalar keys %$bin;
@@ -768,7 +782,7 @@ sub _gen_v2_db {
             $b->{'content'} = $self->encode_base64($b->{'content'});
             push @{ $E->{'Binary'} }, {Key => $key, Value => {__attr__ => [qw(Ref)], Ref => $b->{'ID'}, content => ''}};
         }
-        foreach my $h (@{ $e->{'v2_extra'}->{'history'}||[] }) {
+        foreach my $h (@{ $e->{'history'}||[] }) {
             $gen_entry->($h, $E->{'History'}->{'Entry'} ||= []);
         }
     };
@@ -780,23 +794,23 @@ sub _gen_v2_db {
             __sort__ => [qw(UUID Name Notes IconID Times IsExpanded DefaultAutoTypeSequence EnableAutoType EnableSearching LastTopVisibleEntry)],
             UUID   => $group->{'id'} || join('',map {sprintf '%02X', rand 256} 10),
             Name   => $group->{'title'} || '',
-            Notes  => $group->{'v2_extra'}->{'notes'},
+            Notes  => $group->{'notes'},
             IconID => $group->{'icon'} || 0,
             Times  => {
                 __sort__             => [qw(LastModificationTime CreationTime LastAccessTime ExpiryTime Expires UsageCount LocationChanged)],
-                Expires              => $untri->($group->{'v2_extra'}->{'expires'}),
-                UsageCount           => $group->{'v2_extra'}->{'usage_count'} || 0,
+                Expires              => $untri->($group->{'expires_enabled'}),
+                UsageCount           => $group->{'usage_count'} || 0,
                 LastAccessTime       => $self->_gen_v2_date($group->{'accessed'}),
                 ExpiryTime           => $self->_gen_v2_date($group->{'expires'}),
                 CreationTime         => $self->_gen_v2_date($group->{'created'}),
                 LastModificationTime => $self->_gen_v2_date($group->{'modified'}),
-                LocationChanged      => $self->_gen_v2_date($group->{'v2_extra'}->{'location_changed'}),
+                LocationChanged      => $self->_gen_v2_date($group->{'location_changed'}),
             },
             IsExpanded              => $untri->($group->{'expanded'}),
-            DefaultAutoTypeSequence => $group->{'v2_extra'}->{'default_auto_type'},
-            EnableAutoType          => lc($untri->($group->{'v2_extra'}->{'enable_auto_type'})),
-            EnableSearching         => lc($untri->($group->{'v2_extra'}->{'enable_searching'})),
-            LastTopVisibleEntry     => $group->{'v2_extra'}->{'last_top_entry'},
+            DefaultAutoTypeSequence => $group->{'auto_type_default'},
+            EnableAutoType          => lc($untri->($group->{'auto_type_enabled'})),
+            EnableSearching         => lc($untri->($group->{'enable_searching'})),
+            LastTopVisibleEntry     => $group->{'last_top_entry'},
         };
         $G->{'CustomIconUUID'} = $group->{'custom_icon_uuid'} if $group->{'custom_icon_uuid'}; # TODO
         push @{$G->{'__sort__'}}, 'Entry' if @{ $group->{'entries'} || [] };
