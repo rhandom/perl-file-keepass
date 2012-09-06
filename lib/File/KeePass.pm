@@ -19,7 +19,7 @@ use constant DB_VER_DW        => 0x00030002;
 use constant DB_FLAG_RIJNDAEL => 2;
 use constant DB_FLAG_TWOFISH  => 8;
 
-our $VERSION = '0.03';
+our $VERSION = '2.00';
 my %locker;
 my $salsa20_iv = "\xe8\x30\x09\x4b\x97\x20\x5d\x2a";
 my $qr_date = qr/^(\d\d\d\d)-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(\.\d+|)?Z?$/;
@@ -101,6 +101,7 @@ sub DESTROY { shift->clear }
 sub parse_db {
     my ($self, $buffer, $pass, $args) = @_;
     $self = $self->new($args || {}) if ! ref $self;
+    $buffer = $$buffer if ref $buffer;
 
     my $head = $self->parse_header($buffer);
     $buffer = substr $buffer, $head->{'header_size'};
@@ -252,8 +253,9 @@ sub _parse_v2_body {
                 my ($node, $parent, $parent_tag, $tag) = @_;
                 if ($parent_tag eq 'Binaries') {
                     my ($content, $id, $comp) = @$node{qw(content ID Compressed)};
-                    $content = $self->decode_base64($content); # I think some binaries can also be protected
-                    if ($comp && $comp eq 'True') {
+                    $content = '' if ! defined $content;
+                    $content = $self->decode_base64($content) if length $content;
+                    if ($comp && $comp eq 'True' && length $content) {
                         eval { $content = $self->decompress($content) } or warn "Could not decompress associated binary ($id): $@";
                     }
                     warn "Duplicate binary id $id - using most recent.\n" if exists $BIN{$id};
@@ -490,6 +492,9 @@ sub _parse_v1_entries {
                 next;
             }
 
+            my $bin   = delete $entry->{'binary'};
+            my $bname = delete $entry->{'binary_name'};
+            $entry->{'binary'} = {defined($bname) ? $bname : '' => $bin} if defined($bin) && (length($bin) || (defined($bname) && length($bname)));
             push @{ $ref->{'entries'} }, $entry;
             $entry = {};
         } else {
@@ -522,7 +527,7 @@ sub _master_key {
     ($pass, $file) = @$pass if ref($pass) eq 'ARRAY';
     $pass = sha256($pass) if defined($pass) && length($pass);
     if ($file) {
-        $file = $self->slurp($file);
+        $file = ref($file) ? $$file : $self->slurp($file);
         if (length($file) == 64) {
             $file = join '', map {chr hex} ($file =~ /\G([a-f0-9A-F]{2})/g);
         } elsif (length($file) != 32) {
@@ -581,6 +586,8 @@ sub _gen_v1_db {
     my $entries = '';
     my @g = $self->find_groups({}, $groups);
     if (grep {$_->{'expanded'}} @g) {
+        my $bin = pack 'L', scalar(@g);
+        $bin .= pack('LC', $_->{'id'}, $_->{'expanded'} ? 1 : 0) for @g;
         my $e = ($self->find_entries({title => 'Meta-Info', username => 'SYSTEM', comment => 'KPX_GROUP_TREE_STATE', url => '$'}))[0] || $self->add_entry({
             comment  => 'KPX_GROUP_TREE_STATE',
             title    => 'Meta-Info',
@@ -588,10 +595,8 @@ sub _gen_v1_db {
             url      => '$',
             id       => '00000000000000000000000000000000',
             group    => $g[0],
+            binary   => {'bin-stream' => $bin},
         });
-        $e->{'binary_name'} = 'bin-stream';
-        $e->{'binary'} = pack 'L', scalar(@g);
-        $e->{'binary'} .= pack('LC', $_->{'id'}, $_->{'expanded'} ? 1 : 0) for @g;
     }
     $head->{'n_groups'} = $head->{'n_entries'} = 0;
     foreach my $g (@g) {
@@ -609,7 +614,11 @@ sub _gen_v1_db {
         $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         foreach my $e (@{ $g->{'entries'} || [] }) {
             $head->{'n_entries'}++;
-            defined($e->{$_}) or $e->{$_} = '' for qw(binary binary_name);
+            $e->{'binary'} = {defined($e->{'binary_name'}) ? $e->{'binary_name'} : '' => $e->{'binary'}} if ref($e->{'binary'}) ne 'HASH';
+            my @bkeys = sort keys %{ $e->{'binary'} };
+            warn "Found more than one entry in the binary hashref.  Encoding only the first one of (@bkeys) on a version 1 database.\n" if @bkeys > 1;
+            my $bname = @bkeys ? $bkeys[0] : '';
+            my $bin = $e->{'binary'}->{$bname}; $bin = '' if ! defined $bin;
             my @d = ([1,      pack('LH*', length($e->{'id'})/2, $e->{'id'})],
                      [2,      pack('LL', 4, $g->{'id'}   || 0)],
                      [3,      pack('LL', 4, $e->{'icon'} || 0)],
@@ -622,8 +631,8 @@ sub _gen_v1_db {
                      [0xA,    pack('L', 5). $self->_gen_v1_date($e->{'modified'} || $self->now)],
                      [0xB,    pack('L', 5). $self->_gen_v1_date($e->{'accessed'} || $self->now)],
                      [0xC,    pack('L', 5). $self->_gen_v1_date($e->{'expires'}  || $self->default_exp)],
-                     [0xD,    pack('L', length($e->{'binary_name'})+1)."$e->{'binary_name'}\0"],
-                     [0xE,    pack('L', length($e->{'binary'})).$e->{'binary'}],
+                     [0xD,    pack('L', length($bname)+1)."$bname\0"],
+                     [0xE,    pack('L', length($bin)).$bin],
                      [0xFFFF, pack('L', 0)]);
             push @d, [$_, $e->{'unknown'}->{$_}] for keys %{ $e->{'unknown'} || {} };
             $entries .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
@@ -1227,12 +1236,14 @@ sub add_entry {
         $group = $self->find_group({id => $group}, $groups) || die "Could not find a matching group to add entry to.\n";
     }
 
-    $args->{$_} = ''         for grep {!defined $args->{$_}} qw(title url username password comment binary_name binary);
+    $args->{$_} = ''         for grep {!defined $args->{$_}} qw(title url username password comment);
     $args->{$_} = 0          for grep {!defined $args->{$_}} qw(id icon);
     $args->{$_} = $self->now for grep {!defined $args->{$_}} qw(created accessed modified);
     $args->{'expires'} ||= $self->default_exp;
+    my $bname = delete $args->{'binary_name'};
+    $args->{'binary'} = {defined($bname) ? $bname : '' => $args->{'binary'}} if (exists($args->{'binary'}) || defined($bname)) && ref($args->{'binary'}) ne 'HASH';
     while (!$args->{'id'} || $args->{'id'} !~ /^[a-f0-9]{32}$/ || $self->find_entry({id => $args->{'id'}}, $groups)) {
-        $args->{'id'} = unpack 'H32', sha256(time.rand().$$);
+        $args->{'id'} = join '', map {sprintf '%2x', rand 256} 1..16;
     }
 
     push @{ $group->{'entries'} ||= [] }, $args;
