@@ -112,6 +112,7 @@ sub parse_db {
              : die "Unsupported keepass database version ($head->{'version'})\n";
     (my $meta, $self->{'groups'}) = $self->$meth($buffer, $pass, $head);
     $self->{'header'} = {%$head, %$meta};
+    $self->auto_lock($args->{'auto_lock'}) if exists $args->{'auto_lock'};
 
     $self->lock if $self->auto_lock;
     return $self;
@@ -131,7 +132,7 @@ sub _parse_v1_header {
     my $size = length($buffer);
     die "File was smaller than db header ($size < ".DB_HEADSIZE_V1().")\n" if $size < DB_HEADSIZE_V1;
     my %h = (version => 1, header_size => DB_HEADSIZE_V1);
-    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
+    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key rounds);
     my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
     @h{@f} = unpack $t, $buffer;
     die "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
@@ -174,7 +175,7 @@ sub _parse_v2_header {
             warn "Length of seed key was not 32\n" if length($val) != 32;
             $h{'seed_key'} = $val;
         } elsif ($type == 6) {
-            $h{'seed_rot_n'} = unpack 'L', $val;
+            $h{'rounds'} = unpack 'L', $val;
         } elsif ($type == 7) {
             warn "Length of encryption IV was not 16\n" if length($val) != 16;
             $h{'enc_iv'} = $val;
@@ -454,7 +455,7 @@ sub _parse_v1_entries {
         } elsif ($type == 0xC) {
             $entry->{'expires'}   = $self->_parse_v1_date(substr($buffer, $pos, $size));
 	} elsif ($type == 0xD) {
-            ($entry->{'bin_desc'} = substr($buffer, $pos, $size)) =~ s/\0$//;
+            ($entry->{'binary_name'} = substr($buffer, $pos, $size)) =~ s/\0$//;
 	} elsif ($type == 0xE) {
             $entry->{'binary'}    = substr($buffer, $pos, $size);
         } elsif ($type == 0xFFFF) {
@@ -534,10 +535,10 @@ sub _master_key {
     $head->{'enc_iv'}     ||= join '', map {chr rand 256} 1..16;
     $head->{'seed_rand'}  ||= join '', map {chr rand 256} 1..($head->{'version'} && $head->{'version'} eq '2' ? 32 : 16);
     $head->{'seed_key'}   ||= sha256(time.rand().$$);
-    $head->{'seed_rot_n'} ||= $self->{'seed_rot_n'} || 50_000;
+    $head->{'rounds'} ||= $self->{'rounds'} || ($head->{'version'} && $head->{'version'} eq '2' ? 6_000 : 50_000);
 
     my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
-    $key = $cipher->encrypt($key) for 1 .. $head->{'seed_rot_n'};
+    $key = $cipher->encrypt($key) for 1 .. $head->{'rounds'};
     $key = sha256($key);
     $key = sha256($head->{'seed_rand'}, $key);
     return $key;
@@ -572,6 +573,9 @@ sub gen_db {
 
 sub _gen_v1_db {
     my ($self, $pass, $head, $groups) = @_;
+    if ($head->{'sig2'} && $head->{'sig2'} eq DB_SIG_2_v2) {
+        substr($head->{'seed_rand'}, 16, 16, '') if $head->{'seed_rand'} && length($head->{'seed_rand'}) == 32; # if coming from a v2 db use a smaller key (roundtripable)
+    }
     my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
     my $entries = '';
@@ -585,7 +589,7 @@ sub _gen_v1_db {
             id       => '00000000000000000000000000000000',
             group    => $g[0],
         });
-        $e->{'bin_desc'} = 'bin-stream';
+        $e->{'binary_name'} = 'bin-stream';
         $e->{'binary'} = pack 'L', scalar(@g);
         $e->{'binary'} .= pack('LC', $_->{'id'}, $_->{'expanded'} ? 1 : 0) for @g;
     }
@@ -605,6 +609,7 @@ sub _gen_v1_db {
         $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         foreach my $e (@{ $g->{'entries'} || [] }) {
             $head->{'n_entries'}++;
+            defined($e->{$_}) or $e->{$_} = '' for qw(binary binary_name);
             my @d = ([1,      pack('LH*', length($e->{'id'})/2, $e->{'id'})],
                      [2,      pack('LL', 4, $g->{'id'}   || 0)],
                      [3,      pack('LL', 4, $e->{'icon'} || 0)],
@@ -617,7 +622,7 @@ sub _gen_v1_db {
                      [0xA,    pack('L', 5). $self->_gen_v1_date($e->{'modified'} || $self->now)],
                      [0xB,    pack('L', 5). $self->_gen_v1_date($e->{'accessed'} || $self->now)],
                      [0xC,    pack('L', 5). $self->_gen_v1_date($e->{'expires'}  || $self->default_exp)],
-                     [0xD,    pack('L', length($e->{'bin_desc'})+1)."$e->{'bin_desc'}\0"],
+                     [0xD,    pack('L', length($e->{'binary_name'})+1)."$e->{'binary_name'}\0"],
                      [0xE,    pack('L', length($e->{'binary'})).$e->{'binary'}],
                      [0xFFFF, pack('L', 0)]);
             push @d, [$_, $e->{'unknown'}->{$_}] for keys %{ $e->{'unknown'} || {} };
@@ -626,6 +631,8 @@ sub _gen_v1_db {
     }
     $buffer .= $entries; $entries = '';
 
+    require utf8;
+    utf8::downgrade($buffer);
     $head->{'checksum'} = sha256($buffer);
 
     return $self->_gen_v1_header($head) . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
@@ -633,13 +640,15 @@ sub _gen_v1_db {
 
 sub _gen_v1_header {
     my ($self, $head) = @_;
-    $head->{'sig1'}  ||= DB_SIG_1;
-    $head->{'sig2'}  ||= DB_SIG_2_v1;
-    $head->{'flags'} ||= DB_FLAG_RIJNDAEL;
-    $head->{'ver'}   ||= DB_VER_DW;
+    $head->{'sig1'}  = DB_SIG_1;
+    $head->{'sig2'}  = DB_SIG_2_v1;
+    $head->{'flags'} = DB_FLAG_RIJNDAEL;
+    $head->{'ver'}   = DB_VER_DW;
     $head->{'n_groups'}  ||= 0;
     $head->{'n_entries'} ||= 0;
-    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key seed_rot_n);
+    die "Length of $_ was not 32 (".length($head->{$_}).")\n" for grep {length($head->{$_}) != 32} qw(seed_key checksum);
+    die "Length of $_ was not 16 (".length($head->{$_}).")\n" for grep {length($head->{$_}) != 16} qw(enc_iv seed_rand);
+    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key rounds);
     my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
     my $header = pack $t, @$head{@f};
     die "Invalid generated header\n" if length($header) != DB_HEADSIZE_V1;
@@ -661,6 +670,9 @@ sub _gen_v1_date {
 
 sub _gen_v2_db {
     my ($self, $pass, $head, $groups) = @_;
+    if ($head->{'sig2'} && $head->{'sig2'} eq DB_SIG_2_v1) {
+        $head->{'seed_rand'} = $head->{'seed_rand'}x2 if $head->{'seed_rand'} && length($head->{'seed_rand'}) == 16; # if coming from a v1 db augment the key (roundtripable)
+    }
     my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
 
@@ -860,9 +872,9 @@ sub _gen_v2_date {
 
 sub _gen_v2_header {
     my ($self, $head) = @_;
-    $head->{'sig1'}        ||= DB_SIG_1;
-    $head->{'sig2'}        ||= DB_SIG_2_v2;
-    $head->{'ver'}         ||= DB_VER_DW;
+    $head->{'sig1'}        = DB_SIG_1;
+    $head->{'sig2'}        = DB_SIG_2_v2;
+    $head->{'ver'}         = DB_VER_DW;
     $head->{'comment'}     = '' if ! defined $head->{'comment'};
     $head->{'compression'} = (!$head->{'compression'} || $head->{'compression'} eq '1') ? 1 : 0;
     $head->{'0'}           ||= "\r\n\r\n";
@@ -878,7 +890,7 @@ sub _gen_v2_header {
     $pack->(3, pack 'V', $head->{'compression'} ? 1 : 0);
     $pack->(4, $head->{'seed_rand'});
     $pack->(5, $head->{'seed_key'});
-    $pack->(6, pack 'LL', $head->{'seed_rot_n'}, 0); # a little odd to be double the length but not used
+    $pack->(6, pack 'LL', $head->{'rounds'}, 0); # a little odd to be double the length but not used
     $pack->(7, $head->{'enc_iv'});
     $pack->(8, $head->{'protected_stream_key'});
     $pack->(9, $head->{'start_bytes'});
@@ -902,6 +914,7 @@ sub slurp {
 
 sub decrypt_rijndael_cbc {
     my ($self, $buffer, $key, $enc_iv) = @_;
+    #use Crypt::CBC; return Crypt::CBC->new(-cipher => 'Rijndael', -key => $key, -iv => $enc_iv, -regenerate_key => 0, -prepend_iv => 0)->decrypt($buffer);
     my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
     $cipher->set_iv($enc_iv);
     $buffer = $cipher->decrypt($buffer);
@@ -912,6 +925,7 @@ sub decrypt_rijndael_cbc {
 
 sub encrypt_rijndael_cbc {
     my ($self, $buffer, $key, $enc_iv) = @_;
+    #use Crypt::CBC; return Crypt::CBC->new(-cipher => 'Rijndael', -key => $key, -iv => $enc_iv, -regenerate_key => 0, -prepend_iv => 0)->encrypt($buffer);
     my $cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
     $cipher->set_iv($enc_iv);
     my $extra = (16 - length($buffer) % 16) || 16; # always pad so we can always trim
@@ -1213,7 +1227,7 @@ sub add_entry {
         $group = $self->find_group({id => $group}, $groups) || die "Could not find a matching group to add entry to.\n";
     }
 
-    $args->{$_} = ''         for grep {!defined $args->{$_}} qw(title url username password comment bin_desc binary);
+    $args->{$_} = ''         for grep {!defined $args->{$_}} qw(title url username password comment binary_name binary);
     $args->{$_} = 0          for grep {!defined $args->{$_}} qw(id icon);
     $args->{$_} = $self->now for grep {!defined $args->{$_}} qw(created accessed modified);
     $args->{'expires'} ||= $self->default_exp;
@@ -1285,10 +1299,8 @@ sub lock {
     return 2 if $locker{"$groups"}; # not quite as fast as Scalar::Util::refaddr
 
     my $ref = $locker{"$groups"} = {};
-    foreach my $key (qw(_key _enc_iv)) {
-        $ref->{$key} = '';
-        $ref->{$key} .= chr(int(255 * rand())) for 1..16;
-    }
+    $ref->{'_key'}    = join '', map {chr rand 256} 1..32;
+    $ref->{'_enc_iv'} = join '', map {chr rand 256} 1..16;
 
     foreach my $e ($self->find_entries({}, $groups)) {
         my $pass = delete $e->{'password'}; $pass = '' if ! defined $pass;
@@ -1628,7 +1640,7 @@ style databases (from the header):
     header_size          => 222,
     seed_key             => "1234567890123456", # rand (32 bytes on v2)
     seed_rand            => "12345678901234567890123456789012", # rand
-    seed_rot_n           => 6000,
+    rounds               => 6000,
     sig1                 => "2594363651",
     sig2                 => "3041655655", # indicates db version
     ver                  => 196608,
@@ -1742,7 +1754,7 @@ Groups will look similar to the following:
          level    => 0,
          entries => [{
              accessed => "2010-06-24 15:09:19",
-             bin_desc => "",
+             binary_name => "",
              binary   => "",
              comment  => "",
              created  => "2010-06-24 15:09:19",
@@ -1827,7 +1839,7 @@ an existing group.
 The following fields can be passed to both v1 and v2 databases.
 
     accessed => "2010-06-24 15:09:19", # last accessed date
-    bin_desc => "", # description of the stored binary - typically a filename
+    binary_name => "", # description of the stored binary - typically a filename
     binary   => "", # raw data to be stored in the system - typically a file
     comment  => "", # a comment for the system - auto-type info is normally here
     created  => "2010-06-24 15:09:19", # entry creation date
@@ -1839,11 +1851,27 @@ The following fields can be passed to both v1 and v2 databases.
     url      => "",
     username => "someuser",
     id       => "0a55ac30af68149f62c072d7cc8bd5ee" # randomly generated automatically
-
     group    => $gid, # which group to add the entry to
 
 The group argument's value may also be a reference to a group - such as
 that returned by find_group.
+
+When using a version 2 database, the following additional fields are available:
+
+    expires_enabled   => 0,
+    location_changed  => "2012-08-05 12:12:12",
+    usage_count       => 0,
+    tags              => {},
+    background_color  => '#ff0000',
+    foreground_color  => '#ffffff',
+    custom_icon_uuid  => '234242342aa',
+    history           => undef, # arrayref of previous entry changes
+    override_url      => $node->{'OverrideURL'},
+    auto_type         => delete($node->{'AutoType'}->{'__auto_type__'}) || [],
+    auto_type_enabled => 1,
+    auto_type_munge   => 0, # whether or not to attempt two channel auto typing
+    protected         => {password => 1}, # indicating which strings were/should be salsa20 protected
+    strings           => {'other key' => 'other value'},
 
 =item find_entries
 
