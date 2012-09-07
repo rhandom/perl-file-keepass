@@ -290,7 +290,7 @@ $e = {
 
 my $E = $obj2->add_entry({%$e});#, [$G]);
 ok($E, "Added a complex entry");
-my $e2 = $obj2->find_entry({id => $e->{'id'}});
+$e2 = $obj2->find_entry({id => $e->{'id'}});
 ok($e2, "Found the entry");
 is_deeply($e2, $e, "Entry matches");
 

@@ -234,7 +234,7 @@ is($dump2, $dump, "Dumps should match after gen_db->parse_db");# && diag($dump);
 # test for entry round tripping
 
 $obj2 = File::KeePass->new;
-my $e = {
+$e = {
     accessed => "2010-06-24 15:09:19",
     auto_type => [{
         keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}",
@@ -261,7 +261,7 @@ my $e = {
 
 my $E = $obj2->add_entry({%$e});#, [$G]);
 ok($E, "Added a complex entry");
-my $e2 = $obj2->find_entry({id => $e->{'id'}});
+$e2 = $obj2->find_entry({id => $e->{'id'}});
 ok($e2, "Found the entry");
 is_deeply($e2, $e, "Entry matches");
 
