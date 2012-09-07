@@ -492,9 +492,8 @@ sub _parse_v1_entries {
                 next;
             }
 
-            my $bin   = delete $entry->{'binary'};
-            my $bname = delete $entry->{'binary_name'};
-            $entry->{'binary'} = {defined($bname) ? $bname : '' => $bin} if defined($bin) && (length($bin) || (defined($bname) && length($bname)));
+            $self->_check_v1_binary($entry);
+            $self->_check_v1_auto_type($entry);
             push @{ $ref->{'entries'} }, $entry;
             $entry = {};
         } else {
@@ -502,6 +501,51 @@ sub _parse_v1_entries {
         }
         $pos += $size;
     }
+}
+
+sub _check_v1_binary {
+    my ($self, $e) = @_;
+    if (ref($e->{'binary'}) eq 'HASH') {
+        delete $e->{'binary_name'};
+        return;
+    }
+    my $bin   = delete $e->{'binary'};
+    my $bname = delete $e->{'binary_name'};
+    if ((defined($bin) && length($bin)) || (defined($bname) && length($bname))) {
+        defined($_) or $_ = '' for $bin, $bname;
+        $e->{'binary'} = {$bname => $bin};
+    }
+}
+
+sub _check_v1_auto_type {
+    my ($self, $e, $del) = @_;
+    $e->{'auto_type'} = [$e->{'auto_type'}] if ref($e->{'auto_type'}) eq 'HASH';
+    if (ref($e->{'auto_type'}) eq 'ARRAY') {
+        delete $e->{'auto_type_window'};
+        return;
+    }
+    my @AT;
+    my $key = delete $e->{'auto_type'};
+    my $win = delete $e->{'auto_type_window'};
+    if ((defined($key) && length($key)) || (defined($win) && length($win))) {
+        push @AT, {keys => $key, window => $win};
+    }
+    return if ! $e->{'comment'};
+    my %atw = my @atw = $e->{'comment'} =~ m{ ^Auto-Type-Window((?:-?\d+)?): [\t ]* (.*?) [\t ]*$ }mxg;
+    my %atk = my @atk = $e->{'comment'} =~ m{ ^Auto-Type((?:-?\d+)?): [\t ]* (.*?) [\t ]*$ }mxg;
+    $e->{'comment'} =~ s{ ^Auto-Type(?:-Window)?(?:-?\d+)?: .* \n? }{}mxg;
+    while (@atw) {
+        my ($n, $w) = (shift(@atw), shift(@atw));
+        push @AT, {window => $w, keys => exists($atk{$n}) ? $atk{$n} : $atk{''}};
+    }
+    while (@atk) {
+        my ($n, $k) = (shift(@atk), shift(@atk));
+        push @AT, {keys => $k, window => exists($atw{$n}) ? $atw{$n} : $atw{''}};
+    }
+    for (@AT) { $_->{'window'} = '' if ! defined $_->{'window'}; $_->{'keys'} = '' if ! defined $_->{'keys'} }
+    my %uniq;
+    @AT = grep {!$uniq{"$_->{'window'}\e$_->{'keys'}"}++} @AT;
+    $e->{'auto_type'} = \@AT if @AT;
 }
 
 sub _parse_v1_date {
@@ -614,11 +658,27 @@ sub _gen_v1_db {
         $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         foreach my $e (@{ $g->{'entries'} || [] }) {
             $head->{'n_entries'}++;
-            $e->{'binary'} = {defined($e->{'binary_name'}) ? $e->{'binary_name'} : '' => $e->{'binary'}} if ref($e->{'binary'}) ne 'HASH';
-            my @bkeys = sort keys %{ $e->{'binary'} };
+
+            my $bins = $e->{'binary'} || {}; if (ref($bins) ne 'HASH') { warn "Entry binary field was not a hashref of name/content pairs.\n"; $bins = {} }
+            my @bkeys = sort keys %$bins;
             warn "Found more than one entry in the binary hashref.  Encoding only the first one of (@bkeys) on a version 1 database.\n" if @bkeys > 1;
             my $bname = @bkeys ? $bkeys[0] : '';
-            my $bin = $e->{'binary'}->{$bname}; $bin = '' if ! defined $bin;
+            my $bin = $bins->{$bname}; $bin = '' if ! defined $bin;
+
+            my $at = $e->{'auto_type'} || []; if (ref($at) ne 'ARRAY') { warn "Entry auto_type field was not an arrayref of auto_type info.\n"; $at = [] }
+            my %AT; my @AT;
+            for (@$at) {
+                my ($k, $w) = map {defined($_) ? $_ : ''} @$_{qw(keys window)};
+                push @AT, $k if ! grep {$_ eq $k} @AT;
+                push @{ $AT{$k} }, $w;
+            }
+            my $txt = '';
+            for my $i (0 .. $#AT) {
+                $txt .= "Auto-Type".($i ? "-$i" : '').": $AT[$i]\n";
+                $txt .= "Auto-Type-Window".($i ? "-$i" : '').": $_\n" for @{ $AT{$AT[$i]} };
+            }
+            my $com = defined($e->{'comment'}) ? "$txt$e->{'comment'}" : $txt;
+
             my @d = ([1,      pack('LH*', length($e->{'id'})/2, $e->{'id'})],
                      [2,      pack('LL', 4, $g->{'id'}   || 0)],
                      [3,      pack('LL', 4, $e->{'icon'} || 0)],
@@ -626,7 +686,7 @@ sub _gen_v1_db {
                      [5,      pack('L', length($e->{'url'})+1).   "$e->{'url'}\0"],
                      [6,      pack('L', length($e->{'username'})+1). "$e->{'username'}\0"],
                      [7,      pack('L', length($e->{'password'})+1). "$e->{'password'}\0"],
-                     [8,      pack('L', length($e->{'comment'})+1).  "$e->{'comment'}\0"],
+                     [8,      pack('L', length($com)+1).  "$com\0"],
                      [9,      pack('L', 5). $self->_gen_v1_date($e->{'created'}  || $self->now)],
                      [0xA,    pack('L', 5). $self->_gen_v1_date($e->{'modified'} || $self->now)],
                      [0xB,    pack('L', 5). $self->_gen_v1_date($e->{'accessed'} || $self->now)],
@@ -1228,7 +1288,7 @@ sub delete_group {
 
 sub add_entry {
     my ($self, $args, $groups) = @_;
-    $groups ||= $self->groups;
+    $groups ||= eval { $self->groups } || [];
     die "You must unlock the passwords before adding new entries.\n" if $self->is_locked($groups);
     $args = {%$args};
     my $group = delete($args->{'group'}) || $groups->[0] || $self->add_group({});
@@ -1240,8 +1300,8 @@ sub add_entry {
     $args->{$_} = 0          for grep {!defined $args->{$_}} qw(id icon);
     $args->{$_} = $self->now for grep {!defined $args->{$_}} qw(created accessed modified);
     $args->{'expires'} ||= $self->default_exp;
-    my $bname = delete $args->{'binary_name'};
-    $args->{'binary'} = {defined($bname) ? $bname : '' => $args->{'binary'}} if (exists($args->{'binary'}) || defined($bname)) && ref($args->{'binary'}) ne 'HASH';
+    $self->_check_v1_binary($args);
+    $self->_check_v1_auto_type($args);
     while (!$args->{'id'} || $args->{'id'} !~ /^[a-f0-9]{32}$/ || $self->find_entry({id => $args->{'id'}}, $groups)) {
         $args->{'id'} = join '', map {sprintf '%2x', rand 256} 1..16;
     }
@@ -1580,8 +1640,13 @@ any of the following forms:
     ["password"]                 # same
     ["password", "keyfilename"]  # password and key file
     [undef, "keyfilename"]       # key file only
+    ["password", \"keycontent"]  # password and reference to key file content
+    [undef, \"keycontent"]       # reference to key file content only
 
-The key file is optional, but if specified can be of three types:
+The key file is optional.  It may be passed as a filename, or as a
+scalar reference to the contents of the key file.  If a filename is
+passed it will be read in.  The key file can contain any of the
+following three types:
 
     length 32         # treated as raw key
     length 64         # must be 64 hexidecimal characters
@@ -1600,11 +1665,11 @@ The same master password types passed to load_db can be used here.
 
 =item parse_db
 
-Takes an string containting an encrypted kdb database, a master
-password, and an optional argument hashref.  Returns the File::KeePass
-object on success (can be called as a class method).  Errors die.  The
-resulting database can be accessed via various methods including
-$k->groups.
+Takes a string or a reference to a string containting an encrypted kdb
+database, a master password, and an optional argument hashref.
+Returns the File::KeePass object on success (can be called as a class
+method).  Errors die.  The resulting database can be accessed via
+various methods including $k->groups.
 
     my $k = File::KeePass->new;
     $k->parse_db($loaded_kdb, $pwd);
@@ -1765,8 +1830,6 @@ Groups will look similar to the following:
          level    => 0,
          entries => [{
              accessed => "2010-06-24 15:09:19",
-             binary_name => "",
-             binary   => "",
              comment  => "",
              created  => "2010-06-24 15:09:19",
              expires  => "2999-12-31 23:23:59",
@@ -1844,14 +1907,14 @@ deletes the group.  Returns the group that was just deleted.
 Adds a new entry to the database.  Returns a reference to the new
 entry.  An optional group argument can be passed.  If a group is not
 passed, the entry will be added to the first group in the database.  A
-new entry id will be created if one is not passed or if it conflicts with
-an existing group.
+new entry id will be created if one is not passed or if it conflicts
+with an existing group.
 
 The following fields can be passed to both v1 and v2 databases.
 
     accessed => "2010-06-24 15:09:19", # last accessed date
-    binary_name => "", # description of the stored binary - typically a filename
-    binary   => "", # raw data to be stored in the system - typically a file
+    auto_type => [{keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}", window => "Foo*"}],
+    binary   => {foo => 'content'}; # hashref of filename/content pairs
     comment  => "", # a comment for the system - auto-type info is normally here
     created  => "2010-06-24 15:09:19", # entry creation date
     expires  => "2999-12-31 23:23:59", # date entry expires
@@ -1859,15 +1922,51 @@ The following fields can be passed to both v1 and v2 databases.
     modified => "2010-06-24 15:09:19", # last modified
     title    => "Something",
     password => 'somepass', # will be hidden if the database is locked
-    url      => "",
+    url      => "http://",
     username => "someuser",
-    id       => "0a55ac30af68149f62c072d7cc8bd5ee" # randomly generated automatically
+    id       => "0a55ac30af68149f62c072d7cc8bd5ee", # randomly generated automatically
     group    => $gid, # which group to add the entry to
 
-The group argument's value may also be a reference to a group - such as
-that returned by find_group.
+For compatibility with earlier versions of File::KeePass, it is
+possible to pass in a binary and binary_name when creating an entry.
+They will be automatically converted to the hashref of
+filename/content pairs
 
-When using a version 2 database, the following additional fields are available:
+    binary_name => "foo", # description of the stored binary - typically a filename
+    binary   => "content", # raw data to be stored in the system - typically a file
+
+    # results in
+    binary => {"foo" => "content"}
+
+Typically, version 1 databases store their Auto-Type information
+inside of the comment.  They are also limited to having only one key
+sequence per entry.  File::KeePass 2+ will automatically parse
+Auto-Type values passed in the entry comment and store them out as the
+auto_type arrayref.  This arrayref is serialized back into the comment
+section when saving as a version 1 database.  Version 2 databases have
+a separate storage mechanism for Auto-Type.
+
+    If you passed in:
+    comment => "
+       Auto-Type: {USERNAME}{TAB}{PASSWORD}{ENTER}
+       Auto-Type-Window: Foo*
+       Auto-Type-Window: Bar*
+    ",
+
+    Will result in:
+    auto_type => [{
+        keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}",
+        window => "Foo*"
+     }, {
+        keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}",
+        window => "Bar*"
+     }],
+
+The group argument value may be either an existing group id, or a
+reference to a group - such as that returned by find_group.
+
+When using a version 2 database, the following additional fields are
+also available:
 
     expires_enabled   => 0,
     location_changed  => "2012-08-05 12:12:12",
@@ -1876,9 +1975,8 @@ When using a version 2 database, the following additional fields are available:
     background_color  => '#ff0000',
     foreground_color  => '#ffffff',
     custom_icon_uuid  => '234242342aa',
-    history           => undef, # arrayref of previous entry changes
+    history           => [], # arrayref of previous entry changes
     override_url      => $node->{'OverrideURL'},
-    auto_type         => delete($node->{'AutoType'}->{'__auto_type__'}) || [],
     auto_type_enabled => 1,
     auto_type_munge   => 0, # whether or not to attempt two channel auto typing
     protected         => {password => 1}, # indicating which strings were/should be salsa20 protected
