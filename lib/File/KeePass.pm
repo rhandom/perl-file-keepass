@@ -604,7 +604,7 @@ sub gen_db {
                 || (!exists($head->{'reuse_header'})           # not explicit no
                     && ($self->{'reuse_header'}                # explicit yes
                         || !exists($self->{'reuse_header'}))); # not explicit no
-    $head = $self->header if $reuse;
+    $head = {%{$self->header||{}}, %$head} if $reuse;
     $head->{'version'} = $v ||= $head->{'version'} || '1';
     delete @$head{qw(enc_iv seed_key seed_rand protected_stream_key start_bytes)} if $reuse && $reuse < 0;
 
