@@ -288,7 +288,6 @@ sub _parse_v2_body {
                     auto_type_enabled => $tri->($node->{'EnableAutoType'}),
                     enable_searching  => $tri->($node->{'EnableSearching'}),
                     last_top_entry    => $node->{'LastTopVisibleEntry'},
-                    custom_icon_uuid  => $node->{'CustomIconUUID'},
                     expires_enabled   => $tri->($node->{'Times'}->{'Expires'}),
                     location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
                     usage_count       => $node->{'Times'}->{'UsageCount'},
@@ -309,7 +308,7 @@ sub _parse_v2_body {
                 my %str;
                 for my $s (@{ $node->{'String'} || [] }) {
                     $str{$s->{'Key'}} = $s->{'Value'};
-                    $str{'__protected__'}->{$s->{'Key'}} = 1 if $s->{'__protected__'};
+                    $str{'__protected__'}->{$s->{'Key'} =~ /^(Password|UserName|URL|Notes|Title)$/i ? lc($s->{'Key'}) : $s->{'Key'}} = 1 if $s->{'__protected__'};
                 }
                 my $entry = {
                     accessed => $self->_parse_v2_date($node->{'Times'}->{'LastAccessTime'}),
@@ -330,14 +329,14 @@ sub _parse_v2_body {
                     tags              => $node->{'Tags'},
                     background_color  => $node->{'BackgroundColor'},
                     foreground_color  => $node->{'ForegroundColor'},
-                    custom_icon_uuid  => $node->{'CustomIconUUID'},
-                    history           => $node->{'History'},
                     override_url      => $node->{'OverrideURL'},
                     auto_type         => delete($node->{'AutoType'}->{'__auto_type__'}) || [],
                     auto_type_enabled => $tri->($node->{'AutoType'}->{'Enabled'}),
                     auto_type_munge   => $node->{'AutoType'}->{'DataTransferObfuscation'} ? 1 : 0,
                     protected         => delete($str{'__protected__'}),
                 };
+                $entry->{'history'} = $node->{'History'} if defined $node->{'History'};
+                $entry->{'custom_icon_uuid'} = $node->{'CustomIconUUID'} if defined $node->{'CustomIconUUID'};
                 $entry->{'strings'} = \%str if scalar keys %str;
                 $entry->{'binary'} = delete($node->{'__binary__'}) if $node->{'__binary__'};
                 push @{ $parent->{'__entries__'} }, $entry;
@@ -837,7 +836,8 @@ sub _gen_v2_db {
                 Key => $key,
                 Value => $val,
             };
-            if (($META->{'MemoryProtection'}->{"Protect${key}"} || '') eq 'True' || $e->{'protected'}->{$key}) {
+            if (($META->{'MemoryProtection'}->{"Protect${key}"} || '') eq 'True'
+                || $e->{'protected'}->{$key =~ /^(Password|UserName|URL|Notes|Title)$/ ? lc($key) : $key}) {
                 $s->{'Value'} = {Protected => 'True', content => $val};
                 push @PROTECT_STR, \$s->{'Value'}->{'content'} if length $s->{'Value'}->{'content'};
             }
