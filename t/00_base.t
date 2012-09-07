@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 70;
+use Test::More tests => 76;
 
 use_ok('File::KeePass');
 
@@ -175,7 +175,7 @@ unlink("$file.bak");
 ###----------------------------------------------------------------###
 
 $dump = eval { $obj->dump_groups };
-diag($dump);
+#diag($dump);
 ok($dump, "General - Ran dump groups");
 
 ###----------------------------------------------------------------###
@@ -191,7 +191,7 @@ $obj->delete_group({title => 'Bar'});
 ok(!$obj->find_group({title => 'Bar'}), 'Delete - delete_group worked');
 
 $dump = eval { $obj->dump_groups };
-diag($dump);
+#diag($dump);
 
 ###----------------------------------------------------------------###
 
@@ -206,7 +206,7 @@ $dump = "\n".eval { $obj2->dump_groups };
 $ok = $obj2->parse_db($obj2->gen_db($pass), $pass);
 my $dump2 = "\n".eval { $obj2->dump_groups };
 #diag($dump);
-is($dump2, $dump, "Dumps should match after gen_db->parse_db") && diag($dump);
+is($dump2, $dump, "Dumps should match after gen_db->parse_db");# && diag($dump);
 #exit;
 
 ###----------------------------------------------------------------###
@@ -227,4 +227,44 @@ $dump = "\n".eval { $obj2->dump_groups };
 $ok = $obj2->parse_db($obj2->gen_db($pass), $pass);
 $dump2 = "\n".eval { $obj2->dump_groups };
 #diag($dump2);
-is($dump2, $dump, "Dumps should match after gen_db->parse_db") && diag($dump);
+is($dump2, $dump, "Dumps should match after gen_db->parse_db");# && diag($dump);
+
+###----------------------------------------------------------------###
+
+# test for entry round tripping
+
+$obj2 = File::KeePass->new;
+my $e = {
+    accessed => "2010-06-24 15:09:19",
+    auto_type => [{
+        keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}",
+        window => "Foo*",
+    }, {
+        keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}",
+        window => "Bar*",
+    }],
+    binary   => {foo => 'content'},
+    comment  => "Hey", # a comment for the system - auto-type info is normally here
+    created  => "2010-06-24 15:09:19", # entry creation date
+    expires  => "2999-12-31 23:23:59", # date entry expires
+    icon     => 0, # icon number for use with agents
+    modified => "2010-06-24 15:09:19", # last modified
+    title    => "Something",
+    password => 'somepass', # will be hidden if the database is locked
+    url      => "http://",
+    username => "someuser",
+    id       => "0a55ac30af68149f62c072d7cc8bd5ee", # randomly generated automatically
+};
+
+my $E = $obj2->add_entry({%$e});#, [$G]);
+ok($E, "Added a complex entry");
+my $e2 = $obj2->find_entry({id => $e->{'id'}});
+ok($e2, "Found the entry");
+is_deeply($e2, $e, "Entry matches");
+
+$ok = $obj2->parse_db($obj2->gen_db($pass), $pass, {auto_lock => 0});
+ok($ok, "generated and parsed a file");
+
+my $e3 = $obj2->find_entry({id => $e->{'id'}});
+ok($e3, "Found the entry");
+is_deeply($e3, $e, "Entry still matches after export & import");
