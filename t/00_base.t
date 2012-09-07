@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 76;
+use Test::More tests => 80;
 
 use_ok('File::KeePass');
 
@@ -234,7 +234,7 @@ is($dump2, $dump, "Dumps should match after gen_db->parse_db");# && diag($dump);
 # test for entry round tripping
 
 $obj2 = File::KeePass->new;
-$e = {
+my $E = {
     accessed => "2010-06-24 15:09:19",
     auto_type => [{
         keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}",
@@ -259,15 +259,39 @@ $e = {
     id       => "0a55ac30af68149f62c072d7cc8bd5ee", # randomly generated automatically
 };
 
-my $E = $obj2->add_entry({%$e});#, [$G]);
-ok($E, "Added a complex entry");
-$e2 = $obj2->find_entry({id => $e->{'id'}});
+$e = $obj2->add_entry({%$E});#, [$G]);
+ok($e, "Added a complex entry");
+$e2 = $obj2->find_entry({id => $E->{'id'}});
 ok($e2, "Found the entry");
-is_deeply($e2, $e, "Entry matches");
+is_deeply($e2, $E, "Entry matches");
 
 $ok = $obj2->parse_db($obj2->gen_db($pass), $pass, {auto_lock => 0});
 ok($ok, "generated and parsed a file");
 
-my $e3 = $obj2->find_entry({id => $e->{'id'}});
+my $e3 = $obj2->find_entry({id => $E->{'id'}});
 ok($e3, "Found the entry");
-is_deeply($e3, $e, "Entry still matches after export & import");
+is_deeply($e3, $E, "Entry still matches after export & import");
+
+###----------------------------------------------------------------###
+
+$obj2 = File::KeePass->new;
+my $E = $obj2->add_entry({
+    auto_type => "Bam",
+    auto_type_window => "Win",
+    comment => "Auto-Type: bang\nAuto-Type-Window: Win2",
+
+    binary => "hmmm",
+    binary_name => "name",
+});
+
+is_deeply($E->{'auto_type'}, [{
+    keys => "Bam",
+    window => "Win",
+}, {
+    keys => "bang",
+    window => "Win2",
+}], "Imported from legacy auto_type initializations");
+ok(!$E->{'auto_type_window'}, "Removed extra property");
+
+is_deeply($E->{'binary'}, {name => "hmmm"}, "Imported legacy binary initializations");
+ok(!$E->{'binary_name'}, "Removed extra property");
