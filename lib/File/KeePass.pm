@@ -672,9 +672,9 @@ sub _gen_v1_db {
                 push @{ $AT{$k} }, $w;
             }
             my $txt = '';
-            for my $i (0 .. $#AT) {
-                $txt .= "Auto-Type".($i ? "-$i" : '').": $AT[$i]\n";
-                $txt .= "Auto-Type-Window".($i ? "-$i" : '').": $_\n" for @{ $AT{$AT[$i]} };
+            for my $i (1 .. @AT) {
+                $txt .= "Auto-Type".($i>1 ? "-$i" : '').": $AT[$i-1]\n";
+                $txt .= "Auto-Type-Window".($i>1 ? "-$i" : '').": $_\n" for @{ $AT{$AT[$i-1]} };
             }
             my $com = defined($e->{'comment'}) ? "$txt$e->{'comment'}" : $txt;
 
