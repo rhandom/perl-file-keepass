@@ -275,7 +275,7 @@ is_deeply($e3, $E, "Entry still matches after export & import");
 ###----------------------------------------------------------------###
 
 $obj2 = File::KeePass->new;
-my $E = $obj2->add_entry({
+$e = $obj2->add_entry({
     auto_type => "Bam",
     auto_type_window => "Win",
     comment => "Auto-Type: bang\nAuto-Type-Window: Win2",
@@ -284,14 +284,14 @@ my $E = $obj2->add_entry({
     binary_name => "name",
 });
 
-is_deeply($E->{'auto_type'}, [{
+is_deeply($e->{'auto_type'}, [{
     keys => "Bam",
     window => "Win",
 }, {
     keys => "bang",
     window => "Win2",
 }], "Imported from legacy auto_type initializations");
-ok(!$E->{'auto_type_window'}, "Removed extra property");
+ok(!$e->{'auto_type_window'}, "Removed extra property");
 
-is_deeply($E->{'binary'}, {name => "hmmm"}, "Imported legacy binary initializations");
-ok(!$E->{'binary_name'}, "Removed extra property");
+is_deeply($e->{'binary'}, {name => "hmmm"}, "Imported legacy binary initializations");
+ok(!$e->{'binary_name'}, "Removed extra property");
