@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 76;
+use Test::More tests => 77;
 
 if (!eval {
     require MIME::Base64;
@@ -294,10 +294,13 @@ $e2 = $obj2->find_entry({id => $e->{'id'}});
 ok($e2, "Found the entry");
 is_deeply($e2, $e, "Entry matches");
 
-$ok = $obj2->parse_db($obj2->gen_db($pass, {version => 2, keep_xml => 1}), $pass, {auto_lock => 0});
+$ok = $obj2->parse_db($obj2->gen_db($pass, {version => 2, keep_xml => 1, comment => "hey comment"}), $pass, {auto_lock => 0});
 #print $obj2->{'xml_out'},"\n";
 ok($ok, "generated and parsed a file");
 
 my $e3 = $obj2->find_entry({id => $e->{'id'}});
 ok($e3, "Found the entry");
 is_deeply($e3, $e, "Entry still matches after export & import");
+
+is($obj2->header->{'comment'}, "hey comment", "Comment persisted as well");
+
