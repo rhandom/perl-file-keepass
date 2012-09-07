@@ -242,6 +242,9 @@ my $e = {
     }, {
         keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}",
         window => "Bar*",
+    }, {
+        keys => "{PASSWORD}{ENTER}",
+        window => "Bing*",
     }],
     binary   => {foo => 'content'},
     comment  => "Hey", # a comment for the system - auto-type info is normally here
