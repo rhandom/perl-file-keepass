@@ -243,7 +243,7 @@ is($dump2, $dump, "Dumps should match after gen_db->parse_db");# && diag($dump);
 # test for entry round tripping
 
 $obj2 = File::KeePass->new;
-my $e = {
+$e = {
     accessed => "2010-06-24 15:09:19",
     auto_type => [{
         keys => "{USERNAME}{TAB}{PASSWORD}{ENTER}",
