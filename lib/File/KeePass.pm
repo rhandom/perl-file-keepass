@@ -2,7 +2,7 @@ package File::KeePass;
 
 =head1 NAME
 
-File::KeePass - Interface to KeePass V1 database files
+File::KeePass - Interface to KeePass V1 and V2 database files
 
 =cut
 
