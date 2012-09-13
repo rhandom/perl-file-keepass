@@ -906,7 +906,7 @@ sub _gen_v2_db {
             IconID => $group->{'icon'} || 0,
             Times  => {
                 __sort__             => [qw(LastModificationTime CreationTime LastAccessTime ExpiryTime Expires UsageCount LocationChanged)],
-                Expires              => $untri->($group->{'expires_enabled'}),
+                Expires              => $untri->($group->{'expires_enabled'}, 1),
                 UsageCount           => $group->{'usage_count'} || 0,
                 LastAccessTime       => $self->_gen_v2_date($group->{'accessed'}),
                 ExpiryTime           => $self->_gen_v2_date($group->{'expires'}),
@@ -918,7 +918,7 @@ sub _gen_v2_db {
             DefaultAutoTypeSequence => $group->{'auto_type_default'},
             EnableAutoType          => lc($untri->($group->{'auto_type_enabled'})),
             EnableSearching         => lc($untri->($group->{'enable_searching'})),
-            LastTopVisibleEntry     => $group->{'last_top_entry'},
+            LastTopVisibleEntry     => $uuid->($group->{'last_top_entry'}),
         };
         $G->{'CustomIconUUID'} = $uuid->($group->{'custom_icon_uuid'}) if $group->{'custom_icon_uuid'}; # TODO
         push @{$G->{'__sort__'}}, 'Entry' if @{ $group->{'entries'} || [] };
@@ -1225,8 +1225,6 @@ sub dump_groups {
     my %gargs; for (keys %$args) { $gargs{$2} = $args->{$1} if /^(group_(.+))$/ };
     foreach my $g ($self->find_groups(\%gargs, $groups)) {
         my $indent = '    ' x $g->{'level'};
-use CGI::Ex::Dump qw(debug);
-debug $g if ! defined $g->{'created'};
         $t .= $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'}) $g->{'created'}\n";
         local $g->{'groups'}; # don't recurse while looking for entries since we are already flat
         $t .= "$indent    > $_->{'title'}\t($_->{'id'}) $_->{'created'}\n" for $self->find_entries($args, [$g]);
