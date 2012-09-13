@@ -633,8 +633,8 @@ sub _gen_v1_db {
     my $gid = sub { # v1 groups id size can only be a 32 bit int - not an arbitrary string like in v2
         local $_ = my $gid = shift;
         return $gid{$gid} ||= do {
-            $_ = unpack "N", substr /^[a-z0-9\/+]+=*$/i ? $self->decode_base64($_) : $_, 0, 4 if /\D/ || $_ > 2*32-1;
-            $_ = rand 2*32 while $gid{"\e$_\e"}++;
+            $_ = unpack "N", substr /^[a-z0-9\/+]+=*$/i ? $self->decode_base64($_) : $_, 0, 4 if /\D/ || $_ > 2**32-1;
+            $_ = rand 2**32 while $gid{"\e$_\e"}++;
             $_;
         };
     };
