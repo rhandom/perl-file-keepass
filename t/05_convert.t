@@ -12,9 +12,12 @@ use Test::More tests => 17;
 
 if (!eval {
     require MIME::Base64;
+    require XML::Parser;
+    require Compress::Raw::Zlib;
+    require utf8;
 }) {
     diag "Failed to load library: $@";
-  SKIP: { skip "Missing necessary libraries.\n", 70 };
+  SKIP: { skip "Missing necessary libraries.\n", 17 };
     exit;
 }
 
