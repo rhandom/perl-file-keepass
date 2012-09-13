@@ -1,3 +1,8 @@
+2.01
+    2012-09-13
+        * Fix generation of v1 databases with "unknown" fields
+        * A few other cleanups
+
 2.00
     2012-08-30
         * Add ability to work with kdbx (version 2) reading and writing.
