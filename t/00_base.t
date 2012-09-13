@@ -256,7 +256,7 @@ my $E = {
     password => 'somepass', # will be hidden if the database is locked
     url      => "http://",
     username => "someuser",
-    id       => "0a55ac30af68149f62c072d7cc8bd5ee", # randomly generated automatically
+    id       => "0a55ac30af68149f", # randomly generated automatically
 };
 
 $e = $obj2->add_entry({%$E});#, [$G]);
