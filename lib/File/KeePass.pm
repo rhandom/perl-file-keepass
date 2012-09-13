@@ -345,7 +345,7 @@ sub _parse_v2_body {
                 my $val = $node->{'Value'};
                 if (ref($val) eq 'HASH' && $val->{'Protected'} && $val->{'Protected'} eq 'True') {
                     $val = $val->{'content'};
-                    $node->{'Value'} = length($val) ? $s20_stream->($self->decode_base64($val)) : '';
+                    $node->{'Value'} = (defined($val) && length($val)) ? $s20_stream->($self->decode_base64($val)) : '';
                     $node->{'__protected__'} = 1;
                 }
             },

@@ -1,6 +1,7 @@
 2.02
     2012-09-13
         * Update dependency list and tests
+        * Fix some warnings on older perls
 
 2.01
     2012-09-13
