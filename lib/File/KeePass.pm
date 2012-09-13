@@ -630,10 +630,19 @@ sub _gen_v1_db {
     my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
     my $entries = '';
+    my %gid;
+    my $gid = sub { # v1 groups id size can only be a 32 bit int - not an arbitrary string like in v2
+        local $_ = my $gid = shift;
+        return $gid{$gid} ||= do {
+            $_ = unpack "N", substr /^[a-z0-9\/+]+=*$/i ? $self->decode_base64($_) : $_, 0, 4 if /\D/ || $_ > 2*32-1;
+            $_ = rand 2*32 while $gid{"\e$_\e"}++;
+            $_;
+        };
+    };
     my @g = $self->find_groups({}, $groups);
     if (grep {$_->{'expanded'}} @g) {
         my $bin = pack 'L', scalar(@g);
-        $bin .= pack('LC', $_->{'id'}, $_->{'expanded'} ? 1 : 0) for @g;
+        $bin .= pack('LC', $gid->($_->{'id'}), $_->{'expanded'} ? 1 : 0) for @g;
         my $e = ($self->find_entries({title => 'Meta-Info', username => 'SYSTEM', comment => 'KPX_GROUP_TREE_STATE', url => '$'}))[0] || $self->add_entry({
             comment  => 'KPX_GROUP_TREE_STATE',
             title    => 'Meta-Info',
@@ -647,7 +656,7 @@ sub _gen_v1_db {
     $head->{'n_groups'} = $head->{'n_entries'} = 0;
     foreach my $g (@g) {
         $head->{'n_groups'}++;
-        my @d = ([1,      pack('LL', 4, $g->{'id'})],
+        my @d = ([1,      pack('LL', 4, $gid->($g->{'id'}))],
                  [2,      pack('L', length($g->{'title'})+1)."$g->{'title'}\0"],
                  [3,      pack('L',  5). $self->_gen_v1_date($g->{'created'}  || $self->now)],
                  [4,      pack('L',  5). $self->_gen_v1_date($g->{'modified'} || $self->now)],
@@ -682,7 +691,7 @@ sub _gen_v1_db {
             my $com = defined($e->{'comment'}) ? "$txt$e->{'comment'}" : $txt;
 
             my @d = ([1,      pack('LH*', length($e->{'id'})/2, $e->{'id'})],
-                     [2,      pack('LL', 4, $g->{'id'}   || 0)],
+                     [2,      pack('LL', 4, $gid->($g->{'id'}))],
                      [3,      pack('LL', 4, $e->{'icon'} || 0)],
                      [4,      pack('L', length($e->{'title'})+1)."$e->{'title'}\0"],
                      [5,      pack('L', length($e->{'url'})+1).   "$e->{'url'}\0"],
