@@ -1,7 +1,10 @@
-0.04
+2.00
     2012-08-30
-        * Add kdbx (version 2) reading and writing.
+        * Add ability to work with kdbx (version 2) reading and writing.
         * Allow for using a password, a key file, or a password and a key file.
+        * Other major bug fixes and refactoring
+        * API change - allow for auto parsing of Auto-Type in version 1 databases to match version 2
+        * API change - allow for binary to be a hashref since version 2 supports multiple binaries
 
 0.03
     2010-12-06
