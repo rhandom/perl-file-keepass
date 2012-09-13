@@ -664,7 +664,8 @@ sub _gen_v1_db {
                  [7,      pack('LL', 4, $g->{'icon'}  || 0)],
                  [8,      pack('LS', 2, $g->{'level'} || 0)],
                  [0xFFFF, pack('L', 0)]);
-        push @d, [$_, $g->{'unknown'}->{$_}] for keys %{ $g->{'unknown'} || {} };
+        push @d, [$_, map {pack('L',length $_).$_} $g->{'unknown'}->{$_}]
+            for grep {/^\d+$/ && $_ > 8} keys %{ $g->{'unknown'} || {} };
         $buffer .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         foreach my $e (@{ $g->{'entries'} || [] }) {
             $head->{'n_entries'}++;
@@ -704,7 +705,8 @@ sub _gen_v1_db {
                      [0xD,    pack('L', length($bname)+1)."$bname\0"],
                      [0xE,    pack('L', length($bin)).$bin],
                      [0xFFFF, pack('L', 0)]);
-            push @d, [$_, $e->{'unknown'}->{$_}] for keys %{ $e->{'unknown'} || {} };
+            push @d, [$_, pack('L', length($e->{'unknown'}->{$_})).$e->{'unknown'}->{$_}]
+                for grep {/^\d+$/ && $_ > 0xE} keys %{ $e->{'unknown'} || {} };
             $entries .= pack('S',$_->[0]).$_->[1] for sort {$a->[0] <=> $b->[0]} @d;
         }
     }
