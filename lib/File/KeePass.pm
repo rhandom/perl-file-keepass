@@ -73,7 +73,6 @@ sub save_db {
         unlink($tmp);
     }
 
-    # try to move the file into place
     if (-e $bak) {
         unlink($bak) or unlink($tmp) or die "Could not removing already existing backup $bak: $!\n";
     }
@@ -2161,6 +2160,8 @@ Utilities used to generate version 1 type databases.
 
 =item _gen_v2_header
 
+=item _gen_v2_date
+
 Utilities used to generate version 2 type databases.
 
 =item _master_key
@@ -2169,6 +2170,34 @@ Takes the password and parsed headers.  Returns the
 master key based on database type.
 
 =back
+
+=head1 ONE LINERS
+
+(Long one liners)
+
+Here is a version 1 to version 2, or version 2 to version 1 converter.
+Simply change the extension of the two files.  Someday we will include
+a kdb2kdbx utility to do this for you.
+
+    perl -MFile::KeePass -e 'use IO::Prompt; $p="".prompt("Pass:",-e=>"*",-tty); File::KeePass->load_db(+shift,$p,{auto_lock=>0})->save_db(+shift,$p)' ~/test.kdb ~/test.kdbx
+
+    # OR using graphical prompt
+    perl -MFile::KeePass -e 'chop($p=`zenity --password`); File::KeePass->load_db(+shift,$p,{auto_lock=>0})->save_db(+shift,$p)' ~/test.kdbx ~/test.kdb
+
+    # OR using pure perl (but echoes password)
+    perl -MFile::KeePass -e 'print "Pass:"; chop($p=<STDIN>); File::KeePass->load_db(+shift,$p,{auto_lock=>0})->save_db(+shift,$p)' ~/test.kdbx ~/test.kdb
+
+Dumping the XML from a version 2 database.
+
+    perl -MFile::KeePass -e 'chop($p=`zenity --password`); print File::KeePass->load_db(+shift,$p,{keep_xml=>1})->{xml_in},"\n"' ~/test.kdbx
+
+Outlining group information.
+
+    perl -MFile::KeePass -e 'chop($p=`zenity --password`); print File::KeePass->load_db(+shift,$p)->dump_groups' ~/test.kdbx
+
+Dumping header information
+
+    perl -MFile::KeePass -MData::Dumper -e 'chop($p=`zenity --password`); print Dumper +File::KeePass->load_db(+shift,$p)->header' ~/test.kdbx
 
 =head1 BUGS
 
@@ -2183,16 +2212,18 @@ the moment this is by design.  The data is kept as plain boring data.
 
 =head1 SOURCES
 
-Knowledge about the KeePass DB v1 format was gleaned from the source
-code of keepassx-0.4.3.  That source code is published under the GPL2
-license.  KeePassX 0.4.3 bears the copyright of
+Knowledge about the algorithms necessary to decode a KeePass DB v1
+format was gleaned from the source code of keepassx-0.4.3.  That
+source code is published under the GPL2 license.  KeePassX 0.4.3 bears
+the copyright of
 
     Copyright (C) 2005-2008 Tarek Saidi <tarek.saidi@arcor.de>
     Copyright (C) 2007-2009 Felix Geyer <debfx-keepassx {at} fobos.de>
 
-Knowledge about the KeePass DB v2 format was gleaned from the source
-code of keepassx-2.0-alpha1.  That source code is published under the
-GPL2 or GPL3 license.  KeePassX 2.0-alpha1 bears the copyright of
+Knowledge about the algorithms necessary to decode a KeePass DB v2
+format was gleaned from the source code of keepassx-2.0-alpha1.  That
+source code is published under the GPL2 or GPL3 license.  KeePassX
+2.0-alpha1 bears the copyright of
 
     Copyright: 2010-2012, Felix Geyer <debfx@fobos.de>
                2011-2012, Florian Geyer <blueice@fobos.de>
@@ -2208,7 +2239,7 @@ scratch.
 
 =head1 AUTHOR
 
-Paul Seamons <paul at seamons dot com>
+Paul Seamons <paul@seamons.com>
 
 =head1 LICENSE
 
