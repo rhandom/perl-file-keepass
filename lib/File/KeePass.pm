@@ -204,8 +204,8 @@ sub _parse_v1_body {
     $buffer = $self->decrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 
     die "The file could not be decrypted either because the key is wrong or the file is damaged.\n"
-        if length($buffer) > 2**31 || (!length($buffer) && $head->{'n_groups'});
-    die "The file checksum did not match.\nThe key is wrong or the file is damaged (or we need to implement utf8 input a bit better)\n"
+        if length($buffer) > 2**32-1 || (!length($buffer) && $head->{'n_groups'});
+    die "The file checksum did not match.\nThe key is wrong or the file is damaged\n"
         if $head->{'checksum'} ne sha256($buffer);
 
     my ($groups, $gmap, $pos) = $self->_parse_v1_groups($buffer, $head->{'n_groups'});
@@ -581,7 +581,7 @@ sub _master_key {
             : ($pass && $file) ? sha256($pass, $file) : $pass ? $pass : $file;
     $head->{'enc_iv'}     ||= join '', map {chr rand 256} 1..16;
     $head->{'seed_rand'}  ||= join '', map {chr rand 256} 1..($head->{'version'} && $head->{'version'} eq '2' ? 32 : 16);
-    $head->{'seed_key'}   ||= sha256(time.rand().$$);
+    $head->{'seed_key'}   ||= sha256(time.rand(2**32-1).$$);
     $head->{'rounds'} ||= $self->{'rounds'} || ($head->{'version'} && $head->{'version'} eq '2' ? 6_000 : 50_000);
 
     my $cipher = Crypt::Rijndael->new($head->{'seed_key'}, Crypt::Rijndael::MODE_ECB());
@@ -613,7 +613,7 @@ sub gen_db {
     die "Missing pass\n" if ! defined($pass);
     die "Please unlock before calling gen_db\n" if $self->is_locked($groups);
 
-    srand((time() ^ $$) * rand()) if ! $self->{'no_srand'};
+    srand(rand(time() ^ $$)) if ! $self->{'no_srand'};
     if ($v eq '2') {
         return $self->_gen_v2_db($pass, $head, $groups);
     } else {
@@ -1264,7 +1264,7 @@ sub find_groups {
         $g->{'icon'}  ||= 0;
         while (!defined($g->{'id'}) || $used{$g->{'id'}}++) {
             warn "Found duplicate group_id - generating new one for \"$g->{'title'}\"" if defined($g->{'id'});
-            $g->{'id'} = int((2**32-1) * rand());
+            $g->{'id'} = int(rand 2**32-1);
         }
         if (!@tests || !grep{!$_->($g)} @tests) {
             push @groups, $g;
