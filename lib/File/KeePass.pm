@@ -223,6 +223,12 @@ sub _parse_v2_body {
     $buffer = eval { $self->decompress($buffer) } or die "Failed to decompress document: $@" if ($head->{'compression'} || '') eq '1';
     $self->{'xml_in'} = $buffer if $self->{'keep_xml'} || $head->{'keep_xml'};
 
+    my $uuid = sub {
+        my $id = shift;
+        if ($id) { $id = $self->decode_base64($id);  $id =~ s/^0+(?=\d)// if $id =~ /^\d{16}$/ };
+        return $id;
+    };
+
     # parse the XML - use our own parser since XML::Simple does not do event based actions
     my $tri = sub { return !defined($_[0]) ? undef : ('true' eq lc $_[0]) ? 1 : ('false' eq lc $_[0]) ? 0 : undef };
     my $s20_stream = $self->salsa20_stream({key => sha256($head->{'protected_stream_key'}), iv => $salsa20_iv, rounds => 20});
@@ -273,7 +279,7 @@ sub _parse_v2_body {
             Group => sub {
                 my ($node, $parent, $parent_tag) = @_;
                 my $group = {
-                    id       => $node->{'UUID'},
+                    id       => $uuid->($node->{'UUID'}),
                     icon     => $node->{'IconID'},
                     title    => $node->{'Name'},
                     expanded => $tri->($node->{'IsExpanded'}),
@@ -286,7 +292,7 @@ sub _parse_v2_body {
                     auto_type_default => $node->{'DefaultAutoTypeSequence'},
                     auto_type_enabled => $tri->($node->{'EnableAutoType'}),
                     enable_searching  => $tri->($node->{'EnableSearching'}),
-                    last_top_entry    => $node->{'LastTopVisibleEntry'},
+                    last_top_entry    => $uuid->($node->{'LastTopVisibleEntry'}),
                     expires_enabled   => $tri->($node->{'Times'}->{'Expires'}),
                     location_changed  => $self->_parse_v2_date($node->{'Times'}->{'LocationChanged'}),
                     usage_count       => $node->{'Times'}->{'UsageCount'},
@@ -316,7 +322,7 @@ sub _parse_v2_body {
                     modified => $self->_parse_v2_date($node->{'Times'}->{'LastModificationTime'}),
                     comment  => delete($str{'Notes'}),
                     icon     => $node->{'IconID'},
-                    id       => $node->{'UUID'},
+                    id       => $uuid->($node->{'UUID'}),
                     title    => delete($str{'Title'}),
                     url      => delete($str{'URL'}),
                     username => delete($str{'UserName'}),
@@ -466,7 +472,7 @@ sub _parse_v1_entries {
             if (!$ref) { # orphaned nodes go in special group
                 $gid = -1;
                 if (!$gmap->{$gid}) {
-                    push @$groups, ($gmap->{$gid} = {id => $gid, title => '*Orphaned*', icon => 0});
+                    push @$groups, ($gmap->{$gid} = {id => $gid, title => '*Orphaned*', icon => 0, created => $self->now});
                 }
                 $ref = $gmap->{$gid};
             }
@@ -630,10 +636,10 @@ sub _gen_v1_db {
     my $buffer  = '';
     my $entries = '';
     my %gid;
-    my $gid = sub { # v1 groups id size can only be a 32 bit int - not an arbitrary string like in v2
+    my $gid = sub { # v1 groups id size can only be a 32 bit int - v2 is supposed to be a 16 digit string
         local $_ = my $gid = shift;
         return $gid{$gid} ||= do {
-            $_ = unpack "N", substr /^[a-z0-9\/+]+=*$/i ? $self->decode_base64($_) : $_, 0, 4 if /\D/ || $_ > 2**32-1;
+            $_ = (/^\d+$/ && $_ < 2**32) ? $_ : /^([a-f0-9]{16})/i ? hex($1) : int(rand 2**32);
             $_ = rand 2**32 while $gid{"\e$_\e"}++;
             $_;
         };
@@ -647,7 +653,7 @@ sub _gen_v1_db {
             title    => 'Meta-Info',
             username => 'SYSTEM',
             url      => '$',
-            id       => '00000000000000000000000000000000',
+            id       => '0000000000000000',
             group    => $g[0],
             binary   => {'bin-stream' => $bin},
         });
@@ -689,7 +695,6 @@ sub _gen_v1_db {
                 $txt .= "Auto-Type-Window".($i>1 ? "-$i" : '').": $_\n" for @{ $AT{$AT[$i-1]} };
             }
             my $com = defined($e->{'comment'}) ? "$txt$e->{'comment'}" : $txt;
-
             my @d = ([1,      pack('LH*', length($e->{'id'})/2, $e->{'id'})],
                      [2,      pack('LL', 4, $gid->($g->{'id'}))],
                      [3,      pack('LL', 4, $e->{'icon'} || 0)],
@@ -756,8 +761,17 @@ sub _gen_v2_db {
     }
     my $key = $self->_master_key($pass, $head);
     my $buffer  = '';
-
-    my $untri = sub { return !defined($_[0]) ? 'null' : !$_[0] ? 'False' : 'True' };
+    my $untri = sub { return (!defined($_[0]) && !$_[1]) ? 'null' : !$_[0] ? 'False' : 'True' };
+    my %uuid;
+    my $uuid = sub { # v2 has these as 16 digit strings (not so uu of an id)
+        local $_ = my $id = shift || 0;
+        return defined($uuid{$id}) ? $uuid{$id} : do {
+            $_ = (/^\d+$/ && $_ < 2**32) ? $_ : /^[ -~]{16}$/i ? $_ : substr($self->encode_base64($_),0,16);
+            $_ = sprintf '%016s', $_;
+            $_ = join '', map {sprintf '%02x', rand 256} 1..8 while $uuid{"\e$_\e"}++;
+            $uuid{$id} = $self->encode_base64($_);
+        };
+    };
 
     my @mfld = qw(Generator DatabaseName DatabaseNameChanged DatabaseDescription DatabaseDescriptionChanged DefaultUserName DefaultUserNameChanged
                         MaintenanceHistoryDays Color MasterKeyChanged MasterKeyChangeRec MasterKeyChangeForce MemoryProtection
@@ -782,20 +796,20 @@ sub _gen_v2_db {
     $def->(DatabaseNameChanged        => $now, $qr_date);
     $def->(DefaultUserName            => '');
     $def->(DefaultUserNameChanged     => $now, $qr_date);
-    $def->(EntryTemplatesGroup        => '');
+    $def->(EntryTemplatesGroup        => $uuid->(0));
     $def->(EntryTemplatesGroupChanged => $now, $qr_date);
     $def->(Generator                  => ref($self));
     $def->(HistoryMaxItems            => 10, qr{^\d+$});
     $def->(HistoryMaxSize             => 6291456, qr{^\d+$});
-    $def->(LastSelectedGroup          => '');
-    $def->(LastTopVisibleGroup        => '');
+    $def->(LastSelectedGroup          => $uuid->(0));
+    $def->(LastTopVisibleGroup        => $uuid->(0));
     $def->(MaintenanceHistoryDays     => 365, qr{^\d+$});
     $def->(MasterKeyChangeForce       => -1);
     $def->(MasterKeyChangeRec         => -1);
     $def->(MasterKeyChanged           => $now, $qr_date);
     $def->(RecycleBinChanged          => $now, $qr_date);
-    $def->(RecycleBinUUID             => '');
-    $META->{'RecycleBinEnabled'}      = $untri->(exists($META->{'RecycleBinEnabled'}) ? $META->{'RecycleBinEnabled'} : 1);
+    $def->(RecycleBinUUID             => $uuid->(0));
+    $META->{'RecycleBinEnabled'}      = $untri->(exists($META->{'RecycleBinEnabled'}) ? $META->{'RecycleBinEnabled'} : 1, 1);
     my $p = $META->{'MemoryProtection'} ||= {};
     for my $new (qw(ProtectTitle ProtectUserName ProtectPassword ProtectURL ProtectNotes)) { # unflatten protection
         (my $key = lc $new) =~ s/protect/protect_/;
@@ -820,11 +834,11 @@ sub _gen_v2_db {
         my ($e, $parent) = @_;
         push @$parent, my $E = {
             __sort__ => [qw(UUID IconID ForegroundColor BackgroundColor OverrideURL Tags Times String AutoType History)],
-            UUID   => $e->{'id'} || join('',map {sprintf '%02X', rand 256} 10),
+            UUID   => $uuid->($e->{'id'} ||= join('',map {sprintf '%02x', rand 256} 1..8)),
             IconID => $e->{'icon'} || 0,
             Times  => {
                 __sort__             => [qw(LastModificationTime CreationTime LastAccessTime ExpiryTime Expires UsageCount LocationChanged)],
-                Expires              => $untri->($e->{'expires_enabled'}),
+                Expires              => $untri->($e->{'expires_enabled'}, 1),
                 UsageCount           => $e->{'usage_count'} || 0,
                 LastAccessTime       => $self->_gen_v2_date($e->{'accessed'}),
                 ExpiryTime           => $self->_gen_v2_date($e->{'expires'}),
@@ -835,10 +849,10 @@ sub _gen_v2_db {
             Tags            => $e->{'tags'},
             BackgroundColor => $e->{'background_color'},
             ForegroundColor => $e->{'foreground_color'},
-            CustomIconUUID  => $e->{'custom_icon_uuid'},
+            CustomIconUUID  => $uuid->($e->{'custom_icon_uuid'}),
             OverrideURL     => $e->{'override_url'},
             AutoType        => {
-                Enabled     => $untri->($e->{'auto_type_enabled'}),
+                Enabled     => $untri->($e->{'auto_type_enabled'}, 1),
                 DataTransferObfuscation => $e->{'auto_type_munge'} ? 1 : 0,
             },
         };
@@ -886,7 +900,7 @@ sub _gen_v2_db {
         return if ref($group) ne 'HASH';
         push @$parent, my $G = {
             __sort__ => [qw(UUID Name Notes IconID Times IsExpanded DefaultAutoTypeSequence EnableAutoType EnableSearching LastTopVisibleEntry)],
-            UUID   => $group->{'id'} || join('',map {sprintf '%02X', rand 256} 10),
+            UUID   => $uuid->($group->{'id'} ||= join('',map {sprintf '%02x', rand 256} 1..8)),
             Name   => $group->{'title'} || '',
             Notes  => $group->{'notes'},
             IconID => $group->{'icon'} || 0,
@@ -900,13 +914,13 @@ sub _gen_v2_db {
                 LastModificationTime => $self->_gen_v2_date($group->{'modified'}),
                 LocationChanged      => $self->_gen_v2_date($group->{'location_changed'}),
             },
-            IsExpanded              => $untri->($group->{'expanded'}),
+            IsExpanded              => $untri->($group->{'expanded'}, 1),
             DefaultAutoTypeSequence => $group->{'auto_type_default'},
             EnableAutoType          => lc($untri->($group->{'auto_type_enabled'})),
             EnableSearching         => lc($untri->($group->{'enable_searching'})),
             LastTopVisibleEntry     => $group->{'last_top_entry'},
         };
-        $G->{'CustomIconUUID'} = $group->{'custom_icon_uuid'} if $group->{'custom_icon_uuid'}; # TODO
+        $G->{'CustomIconUUID'} = $uuid->($group->{'custom_icon_uuid'}) if $group->{'custom_icon_uuid'}; # TODO
         push @{$G->{'__sort__'}}, 'Entry' if @{ $group->{'entries'} || [] };
         foreach my $e (@{ $group->{'entries'} || [] }) {
             $gen_entry->($e, $G->{'Entry'} ||= []);
@@ -1211,6 +1225,8 @@ sub dump_groups {
     my %gargs; for (keys %$args) { $gargs{$2} = $args->{$1} if /^(group_(.+))$/ };
     foreach my $g ($self->find_groups(\%gargs, $groups)) {
         my $indent = '    ' x $g->{'level'};
+use CGI::Ex::Dump qw(debug);
+debug $g if ! defined $g->{'created'};
         $t .= $indent.($g->{'expanded'} ? '-' : '+')."  $g->{'title'} ($g->{'id'}) $g->{'created'}\n";
         local $g->{'groups'}; # don't recurse while looking for entries since we are already flat
         $t .= "$indent    > $_->{'title'}\t($_->{'id'}) $_->{'created'}\n" for $self->find_entries($args, [$g]);
@@ -1268,6 +1284,14 @@ sub find_groups {
             warn "Found duplicate group_id - generating new one for \"$g->{'title'}\"" if defined($g->{'id'});
             $g->{'id'} = int(rand 2**32-1);
         }
+
+        ## to match v1 and v2 databases, the gid should be a 32 bit number that is also 16 chars - but delay converting if we can
+        #local $_ = (defined($g->{'id'}) && length($g->{'id'})) ? $g->{'id'} : int rand 2**32;
+        #$_ = (/^(\d+)$/ && $1 < 2**32) ? $1 : /^[ -~]{16}$/i ? $_ : substr($self->encode_base64($_),0,16);
+        #$_ = sprintf '%016s', $_;
+        #$_ = sprintf '%016d', int(rand 2**32) while $used{"\e$_\e"}++;
+        #$g->{'id'} = $_;
+
         if (!@tests || !grep{!$_->($g)} @tests) {
             push @groups, $g;
             push @{ $self->{'__group_groups'} }, $container if $self->{'__group_groups'};
@@ -1315,8 +1339,9 @@ sub add_entry {
     $args->{'expires'} ||= $self->default_exp;
     $self->_check_v1_binary($args);
     $self->_check_v1_auto_type($args);
-    while (!$args->{'id'} || $args->{'id'} !~ /^[a-f0-9]{32}$/ || $self->find_entry({id => $args->{'id'}}, $groups)) {
-        $args->{'id'} = join '', map {sprintf '%2x', rand 256} 1..16;
+
+    while (!$args->{'id'} || $args->{'id'} !~ /^[a-f0-9]{16}$/ || $self->find_entry({id => $args->{'id'}}, $groups)) {
+        $args->{'id'} = join '', map {sprintf '%02x', rand 256} 1..8;
     }
 
     push @{ $group->{'entries'} ||= [] }, $args;
@@ -1838,7 +1863,7 @@ Groups will look similar to the following:
     $g = [{
          expanded => 0,
          icon     => 0,
-         id       => 234234234,
+         id       => 234234234, # under v1 this is a 32 bit int, under v2 it is a 16 char id
          title    => 'Foo',
          level    => 0,
          entries => [{
@@ -1852,7 +1877,7 @@ Groups will look similar to the following:
              password => 'somepass', # will be hidden if the database is locked
              url      => "",
              username => "someuser",
-             id       => "0a55ac30af68149f62c072d7cc8bd5ee"
+             id       => "0a55ac30af68149f", # v1 is any hex char, v2 is any 16 char
          }],
          groups => [{
              expanded => 0,
@@ -1937,7 +1962,7 @@ The following fields can be passed to both v1 and v2 databases.
     password => 'somepass', # will be hidden if the database is locked
     url      => "http://",
     username => "someuser",
-    id       => "0a55ac30af68149f62c072d7cc8bd5ee", # randomly generated automatically
+    id       => "0a55ac30af68149f", # auto generated if needed, v1 is any hex char, v2 is any 16 char
     group    => $gid, # which group to add the entry to
 
 For compatibility with earlier versions of File::KeePass, it is
