@@ -1,3 +1,7 @@
+2.02
+    2012-09-13
+        * Update dependency list and tests
+
 2.01
     2012-09-13
         * Fix generation of v1 databases with "unknown" fields

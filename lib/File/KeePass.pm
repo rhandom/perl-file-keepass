@@ -19,7 +19,7 @@ use constant DB_VER_DW        => 0x00030002;
 use constant DB_FLAG_RIJNDAEL => 2;
 use constant DB_FLAG_TWOFISH  => 8;
 
-our $VERSION = '2.01';
+our $VERSION = '2.02';
 my %locker;
 my $salsa20_iv = "\xe8\x30\x09\x4b\x97\x20\x5d\x2a";
 my $qr_date = qr/^(\d\d\d\d)-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(\.\d+|)?Z?$/;

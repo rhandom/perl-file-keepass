@@ -14,6 +14,9 @@ WriteMakefile(
               PREREQ_PM     => {
                   'Crypt::Rijndael' => '1.0',
                   'Digest::SHA'     => '1.0',
+                  'MIME::Base64'    => '1.0',
+                  #'Compress::Raw::Zlib' => '1.0', # not a requirement for v1 only infrastructure
+                  #'XML::Parser'     => '1.0', # not a requirement for v1 only infrastructure
               },
               dist          => {
                 DIST_DEFAULT => 'all tardist',
