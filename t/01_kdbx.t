@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 77;
+use Test::More tests => 78;
 
 if (!eval {
     require MIME::Base64;
@@ -17,7 +17,7 @@ if (!eval {
     require utf8;
 }) {
     diag "Failed to load library: $@";
-  SKIP: { skip "Missing necessary libraries.\n", 77 };
+  SKIP: { skip "Missing necessary libraries.\n", 78 };
     exit;
 }
 
@@ -84,6 +84,7 @@ is($g_2, $g, "Search - Greater than searching works");
 my $e  = $obj->add_entry({title => 'bam', password => 'flimflam'}); # defaults to first group
 ok($e, "Entry - Added an entry");
 my $eid = $e->{'id'};
+
 ok($eid, "Entry - Added an entry");
 my $e2 = $obj->add_entry({title => 'bim', username => 'BIM', group => $g2});
 my $eid2 = $e2->{'id'};
@@ -176,7 +177,7 @@ ok(!eval { $obj->load_db }, "File - Missing file");
 ok(!eval { $obj->load_db($file) }, "File - Missing pass");
 ok($obj->load_db($file, $pass), "File - Loaded from file");
 
-ok($g = $obj->find_group({id => $gid}), "File - Found a group in parsed results");
+ok($g = $obj->find_group({id => $gid}), "File - Found a group in parsed results for gid ($gid)");
 is($g->{'title'}, 'Foo', "File - Was the correct group");
 ok($g->{'expanded'}, "File - Expanded was passed along correctly");
 
@@ -243,6 +244,8 @@ is($dump2, $dump, "Dumps should match after gen_db->parse_db");# && diag($dump);
 ###----------------------------------------------------------------###
 
 # test for entry round tripping
+my $_id = File::KeePass->gen_uuid();
+ok($_id, "Can generate a uuid");
 
 $obj2 = File::KeePass->new;
 $e = {
@@ -270,7 +273,7 @@ $e = {
     password => 'somepass', # will be hidden if the database is locked
     url      => "http://",
     username => "someuser",
-    id       => "0a55ac30af68149f62c072d7cc8bd5ee", # randomly generated automatically
+    id       => $_id,
 
     auto_type_enabled => 1,
     auto_type_munge => 1,

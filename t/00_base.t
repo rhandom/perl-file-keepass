@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 80;
+use Test::More tests => 81;
 
 use_ok('File::KeePass');
 
@@ -232,6 +232,8 @@ is($dump2, $dump, "Dumps should match after gen_db->parse_db");# && diag($dump);
 ###----------------------------------------------------------------###
 
 # test for entry round tripping
+my $_id = File::KeePass->gen_uuid();
+ok($_id, "Can generate a uuid");
 
 $obj2 = File::KeePass->new;
 my $E = {
@@ -256,7 +258,7 @@ my $E = {
     password => 'somepass', # will be hidden if the database is locked
     url      => "http://",
     username => "someuser",
-    id       => "0a55ac30af68149f", # randomly generated automatically
+    id       => $_id,
 };
 
 $e = $obj2->add_entry({%$E});#, [$G]);
