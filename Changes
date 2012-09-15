@@ -1,3 +1,14 @@
+2.03
+    2012-09-15
+        * Generated kdbx files now actually open up with KeePass2
+        * Cleanup uuid management (compatible with both v1 and v2)
+        * Add HeaderHash generation and checking
+        * Fix the file version numbers
+        * Add deleted objects support
+        * Fix bug in chunksum
+        * Add a top level group node when writing a v2 database if there are more than 1 root level group - auto remove on load
+        * Better default times
+
 2.02
     2012-09-13
         * Update dependency list and tests
