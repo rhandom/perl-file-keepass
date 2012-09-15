@@ -15,7 +15,8 @@ use constant DB_HEADSIZE_V1   => 124;
 use constant DB_SIG_1         => 0x9AA2D903;
 use constant DB_SIG_2_v1      => 0xB54BFB65;
 use constant DB_SIG_2_v2      => 0xB54BFB67;
-use constant DB_VER_DW        => 0x00030002;
+use constant DB_VER_DW_V1     => 0x00030002;
+use constant DB_VER_DW_V2     => 0x00030000; # recent KeePass is 0x0030001
 use constant DB_FLAG_RIJNDAEL => 2;
 use constant DB_FLAG_TWOFISH  => 8;
 
@@ -103,6 +104,7 @@ sub parse_db {
     $buffer = $$buffer if ref $buffer;
 
     my $head = $self->parse_header($buffer);
+    local $head->{'raw'} = substr $buffer, 0, $head->{'header_size'} if $head->{'version'} == 2;
     $buffer = substr $buffer, $head->{'header_size'};
 
     $self->unlock if $self->{'groups'}; # make sure we don't leave dangling keys should we reopen a new db
@@ -135,7 +137,7 @@ sub _parse_v1_header {
     my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key rounds);
     my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
     @h{@f} = unpack $t, $buffer;
-    die "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW & 0xFFFFFF00;
+    die "Unsupported file version ($h{'ver'}).\n" if $h{'ver'} & 0xFFFFFF00 != DB_VER_DW_V1 & 0xFFFFFF00;
     $h{'enc_type'} = ($h{'flags'} & DB_FLAG_RIJNDAEL) ? 'rijndael'
                    : ($h{'flags'} & DB_FLAG_TWOFISH)  ? 'twofish'
                    : die "Unknown encryption type\n";
@@ -242,7 +244,7 @@ sub _parse_v2_body {
     my $level = 0;
     my $data = $self->parse_xml($buffer, {
         top            => 'KeePassFile',
-        force_array    => {map {$_ => 1} qw(Binaries Binary Group Entry String Association Item)},
+        force_array    => {map {$_ => 1} qw(Binaries Binary Group Entry String Association Item DeletedObject)},
         start_handlers => {Group => sub { $level++ }},
         end_handlers   => {
             Meta => sub {
@@ -258,6 +260,8 @@ sub _parse_v2_body {
                 }
                 $META->{'recycle_bin_enabled'} = $tri->($META->{'recycle_bin_enabled'});
                 $META->{$_} = $uuid->($META->{$_}) for qw(entry_templates_group last_selected_group last_top_visible_group recycle_bin_uuid);
+                die "HeaderHash recorded in file did not match actual hash of header.\n"
+                    if $META->{'header_hash'} && $head->{'raw'} && $META->{'header_hash'} ne $self->encode_base64(sha256($head->{'raw'}));
             },
             Binary => sub {
                 my ($node, $parent, $parent_tag, $tag) = @_;
@@ -367,6 +371,17 @@ sub _parse_v2_body {
             History => sub {
                 my ($node, $parent, $parent_tag, $tag) = @_;
                 $parent->{$tag} = delete($node->{'__entries__'}) || [];
+            },
+            Association => sub {
+                my ($node, $parent) = @_;
+                push @{ $parent->{'__auto_type__'} },  {window => $node->{'Window'}, keys => $node->{'KeystrokeSequence'}};
+            },
+            DeletedObject => sub {
+                my ($node) = @_;
+                push @{ $GROUPS[0]->{'deleted_objects'} }, {
+                    uuid => $self->decode_base64($node->{'UUID'}),
+                    date => $self->_parse_v2_date($node->{'DeletionTime'}),
+                } if $GROUPS[0] && $node->{'UUID'} && $node->{'DeletionTime'};
             },
         },
     });
@@ -737,7 +752,7 @@ sub _gen_v1_header {
     $head->{'sig1'}  = DB_SIG_1;
     $head->{'sig2'}  = DB_SIG_2_v1;
     $head->{'flags'} = DB_FLAG_RIJNDAEL;
-    $head->{'ver'}   = DB_VER_DW;
+    $head->{'ver'}   = DB_VER_DW_V1;
     $head->{'n_groups'}  ||= 0;
     $head->{'n_entries'} ||= 0;
     die "Length of $_ was not 32 (".length($head->{$_}).")\n" for grep {length($head->{$_}) != 32} qw(seed_key checksum);
@@ -767,13 +782,18 @@ sub _gen_v2_db {
     if ($head->{'sig2'} && $head->{'sig2'} eq DB_SIG_2_v1) {
         $head->{'seed_rand'} = $head->{'seed_rand'}x2 if $head->{'seed_rand'} && length($head->{'seed_rand'}) == 16; # if coming from a v1 db augment the key (roundtripable)
     }
+    $head->{'compression'} = 1 if ! defined $head->{'compression'};
+    $head->{'start_bytes'} ||= join '', map {chr rand 256} 1 .. 32;
+    $head->{'protected_stream_key'} ||= join '', map {chr rand 256} 1..32;
     my $key = $self->_master_key($pass, $head);
+    my $header = $self->_gen_v2_header($head);
+
     my $buffer  = '';
     my $untri = sub { return (!defined($_[0]) && !$_[1]) ? 'null' : !$_[0] ? 'False' : 'True' };
     my %uniq;
     my $uuid = sub { my $id = (defined($_[0]) && $_[0] eq '0') ? "\0"x16 : $self->uuid($_[0], \%uniq); return $self->encode_base64($id) };
 
-    my @mfld = qw(Generator DatabaseName DatabaseNameChanged DatabaseDescription DatabaseDescriptionChanged DefaultUserName DefaultUserNameChanged
+    my @mfld = qw(Generator HeaderHash DatabaseName DatabaseNameChanged DatabaseDescription DatabaseDescriptionChanged DefaultUserName DefaultUserNameChanged
                         MaintenanceHistoryDays Color MasterKeyChanged MasterKeyChangeRec MasterKeyChangeForce MemoryProtection
                         RecycleBinEnabled RecycleBinUUID RecycleBinChanged EntryTemplatesGroup EntryTemplatesGroupChanged HistoryMaxItems HistoryMaxSize
                         LastSelectedGroup LastTopVisibleGroup Binaries CustomData);
@@ -788,6 +808,7 @@ sub _gen_v2_db {
         $META->{$k} = $self->_gen_v2_date($META->{$k}) if $k =~ /Changed$/;
     };
     my $now = $self->_gen_v2_date;
+    $META->{'HeaderHash'} = $self->encode_base64(sha256($header));
     $def->(Color                      => '');
     $def->(DatabaseDescription        => '');
     $def->(DatabaseDescriptionChanged => $now, $qr_date);
@@ -928,7 +949,15 @@ sub _gen_v2_db {
     };
     $rec->($_, \@GROUPS) for @$groups;
 
-    $head->{'protected_stream_key'} ||= join '', map {chr rand 256} 1..32;
+    if (@$groups && $groups->[0]->{'deleted_objects'}) {
+        foreach my $dob (@{ $groups->[0]->{'deleted_objects'} }) {
+            push @{ $data->{'Root'}->{'DeletedObjects'}->{'DeletedObject'} }, {
+                UUID => $self->encode_base64($dob->{'uuid'}),
+                DeletionTime => $self->_gen_v2_date($dob->{'date'}),
+            }
+        }
+    }
+
     my $s20_stream = $self->salsa20_stream({key => sha256($head->{'protected_stream_key'}), iv => $salsa20_iv, rounds => 20});
     for my $ref (@PROTECT_BIN, @PROTECT_STR) {
         $$ref = $self->encode_base64($s20_stream->($$ref));
@@ -942,19 +971,18 @@ sub _gen_v2_db {
         sort => {
             AutoType => [qw(Enabled DataTransferObfuscation Association)],
             Association => [qw(Window KeystrokeSequence)],
+            DeletedObject => [qw(UUID DeletionTime)],
         },
         no_trailing_newline => 1,
     });
     $self->{'xml_out'} = $buffer if $self->{'keep_xml'} || $head->{'keep_xml'};
 
-    $head->{'compression'} = 1 if ! defined $head->{'compression'};
     $buffer = $self->compress($buffer) if $head->{'compression'} eq '1';
     $buffer = $self->chunksum($buffer);
 
-    $head->{'start_bytes'} ||= join '', map {chr rand 256} 1 .. 32;
     substr $buffer, 0, 0, $head->{'start_bytes'};
 
-    return $self->_gen_v2_header($head) . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
+    return $header . $self->encrypt_rijndael_cbc($buffer, $key, $head->{'enc_iv'});
 }
 
 sub _gen_v2_date {
@@ -968,9 +996,9 @@ sub _gen_v2_header {
     my ($self, $head) = @_;
     $head->{'sig1'}        = DB_SIG_1;
     $head->{'sig2'}        = DB_SIG_2_v2;
-    $head->{'ver'}         = DB_VER_DW;
+    $head->{'ver'}         = DB_VER_DW_V2;
     $head->{'comment'}     = '' if ! defined $head->{'comment'};
-    $head->{'compression'} = (!$head->{'compression'} || $head->{'compression'} eq '1') ? 1 : 0;
+    $head->{'compression'} = (!defined($head->{'compression'}) || $head->{'compression'} eq '1') ? 1 : 0;
     $head->{'0'}           ||= "\r\n\r\n";
     $head->{'protected_stream_key'} ||= join '', map {chr rand 256} 1..32;
     die "Missing start_bytes\n" if ! $head->{'start_bytes'};
@@ -978,6 +1006,7 @@ sub _gen_v2_header {
     die "Length of enc_iv was not 16\n" if length($head->{'enc_iv'}) != 16;
 
     my $buffer = pack 'L3', @$head{qw(sig1 sig2 ver)};
+
     my $pack = sub { my ($type, $str) = @_; $buffer .= pack('C S', $type, length($str)) . $str };
     $pack->(1, $head->{'comment'}) if defined($head->{'comment'}) && length($head->{'comment'});
     $pack->(2, "\x31\xc1\xf2\xe6\xbf\x71\x43\x50\xbe\x58\x05\x21\x6a\xfc\x5a\xff"); # aes cipher
@@ -1034,7 +1063,7 @@ sub unchunksum {
         my ($index, $hash, $size) = unpack "\@$pos L a32 i", $buffer;
         $pos += 40;
         if ($size == 0) {
-            warn "Found mismatch for 0 chunksize\n" if $hash !~ /^\x00{32}$/;
+            warn "Found mismatch for 0 chunksize\n" if $hash ne "\0"x32;
             last;
         }
         #print "$index $hash $size\n";
@@ -1054,10 +1083,11 @@ sub chunksum {
     my $pos = 0;
     while ($pos < length($buffer)) {
         my $chunk = substr($buffer, $pos, $chunk_size);
-        $new .= pack("L a32 i", $index++, sha256($chunk), length($chunk));
+        $new .= pack "L a32 i", $index++, sha256($chunk), length($chunk);
         $new .= $chunk;
         $pos += length($chunk);
     }
+    $new .= pack "L a32 i", $index++, "\0"x32, 0;
     return $new;
 }
 
