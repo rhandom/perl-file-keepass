@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 81;
+use Test::More tests => 84;
 
 use_ok('File::KeePass');
 
@@ -189,6 +189,22 @@ ok(!eval { $obj->delete_group({}) }, "Delete - fails on delete of too many group
 ok(scalar $obj->find_group({title => 'Bar'}), 'Delete - found group');
 $obj->delete_group({title => 'Bar'});
 ok(!$obj->find_group({title => 'Bar'}), 'Delete - delete_group worked');
+
+$dump = eval { $obj->dump_groups };
+#diag($dump);
+
+$obj->add_group({title => 'Bar'});
+$obj->add_group({title => 'Baz'});
+$obj->add_group({title => 'Bing'});
+
+$obj->delete_group({title => 'Bar'});
+ok(!$obj->find_group({title => 'Bar'}), 'Delete - delete_group worked');
+
+$obj->delete_group({title => 'Bing'});
+ok(!$obj->find_group({title => 'Bing'}), 'Delete - delete_group worked');
+
+$obj->delete_group({title => 'Baz'});
+ok(!$obj->find_group({title => 'Baz'}), 'Delete - delete_group worked');
 
 $dump = eval { $obj->dump_groups };
 #diag($dump);
