@@ -313,7 +313,6 @@ sub _parse_v2_body {
                 if ($parent_tag eq 'Group') {
                     push @{ $parent->{'__groups__'} }, $group;
                 } else {
-                    $group->{'__parent_tag__'} = $parent_tag;
                     push @GROUPS, $group;
                 }
             },
@@ -386,6 +385,10 @@ sub _parse_v2_body {
         },
     });
 
+    my $g = $GROUPS[0];
+    @GROUPS = @{ $g->{'groups'} } if @GROUPS == 1
+        && $g && $g->{'notes'} && $g->{'notes'} eq "Added as a top group by File::KeePass"
+        && @{ $g->{'groups'} || [] } && !@{ $g->{'entries'} || [] } && !$g->{'auto_type_default'};
     return ($META, \@GROUPS);
 }
 
@@ -860,7 +863,7 @@ sub _gen_v2_db {
                 Expires              => $untri->($e->{'expires_enabled'}, 1),
                 UsageCount           => $e->{'usage_count'} || 0,
                 LastAccessTime       => $self->_gen_v2_date($e->{'accessed'}),
-                ExpiryTime           => $self->_gen_v2_date($e->{'expires'}),
+                ExpiryTime           => $self->_gen_v2_date($e->{'expires'} || $self->default_exp),
                 CreationTime         => $self->_gen_v2_date($e->{'created'}),
                 LastModificationTime => $self->_gen_v2_date($e->{'modified'}),
                 LocationChanged      => $self->_gen_v2_date($e->{'location_changed'}),
@@ -871,7 +874,7 @@ sub _gen_v2_db {
             CustomIconUUID  => $uuid->($e->{'custom_icon_uuid'} || 0),
             OverrideURL     => $e->{'override_url'},
             AutoType        => {
-                Enabled     => $untri->($e->{'auto_type_enabled'}, 1),
+                Enabled     => $untri->(exists($e->{'auto_type_enabled'}) ? $e->{'auto_type_enabled'} : 1, 1),
                 DataTransferObfuscation => $e->{'auto_type_munge'} ? 1 : 0,
             },
         };
@@ -928,15 +931,15 @@ sub _gen_v2_db {
                 Expires              => $untri->($group->{'expires_enabled'}, 1),
                 UsageCount           => $group->{'usage_count'} || 0,
                 LastAccessTime       => $self->_gen_v2_date($group->{'accessed'}),
-                ExpiryTime           => $self->_gen_v2_date($group->{'expires'}),
+                ExpiryTime           => $self->_gen_v2_date($group->{'expires'} || $self->default_exp),
                 CreationTime         => $self->_gen_v2_date($group->{'created'}),
                 LastModificationTime => $self->_gen_v2_date($group->{'modified'}),
                 LocationChanged      => $self->_gen_v2_date($group->{'location_changed'}),
             },
             IsExpanded              => $untri->($group->{'expanded'}, 1),
             DefaultAutoTypeSequence => $group->{'auto_type_default'},
-            EnableAutoType          => lc($untri->($group->{'auto_type_enabled'})),
-            EnableSearching         => lc($untri->($group->{'enable_searching'})),
+            EnableAutoType          => lc($untri->(exists($group->{'auto_type_enabled'}) ? $group->{'auto_type_enabled'} : 1)),
+            EnableSearching         => lc($untri->(exists($group->{'enable_searching'}) ? $group->{'enable_searching'} : 1)),
             LastTopVisibleEntry     => $uuid->($group->{'last_top_entry'} || 0),
         };
         $G->{'CustomIconUUID'} = $uuid->($group->{'custom_icon_uuid'}) if $group->{'custom_icon_uuid'}; # TODO
@@ -947,6 +950,7 @@ sub _gen_v2_db {
         push @{$G->{'__sort__'}}, 'Group' if @{ $group->{'groups'} || [] };
         $rec->($_, $G->{'Group'} ||= []) for @{ $group->{'groups'} || []};
     };
+    $groups = [{title => "Database", groups => [@$groups], notes => "Added as a top group by File::KeePass", expanded => 1}] if @$groups > 1;
     $rec->($_, \@GROUPS) for @$groups;
 
     if (@$groups && $groups->[0]->{'deleted_objects'}) {
